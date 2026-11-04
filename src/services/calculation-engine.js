@@ -89,34 +89,103 @@ function computeReconciliationDiscrepancy(gatewayFact, settlementFact) {
     };
 }
 
-function evaluateDeterministicCalculations(question, facts = []) {
+/**
+ * Deterministically computes period-over-period comparison variance across 2 dates/periods.
+ */
+function computePeriodComparison(facts = [], period1 = '', period2 = '') {
+    const comparisons = [];
+    if (!facts || facts.length === 0) return comparisons;
+
+    const p1 = (period1 || '').toLowerCase();
+    const p2 = (period2 || '').toLowerCase();
+
+    // Group facts by metric
+    const byMetric = new Map();
+    for (const f of facts) {
+        if (f.NumericValue !== null) {
+            const m = (f.Metric || '').trim();
+            if (!byMetric.has(m)) byMetric.set(m, []);
+            byMetric.get(m).push(f);
+        }
+    }
+
+    for (const [metric, metricFacts] of byMetric.entries()) {
+        let fact1 = null;
+        let fact2 = null;
+
+        if (p1 && p2) {
+            fact1 = metricFacts.find(f => (f.PeriodLabel || '').toLowerCase().includes(p1) || (f.SourceLocation || '').toLowerCase().includes(p1));
+            fact2 = metricFacts.find(f => (f.PeriodLabel || '').toLowerCase().includes(p2) || (f.SourceLocation || '').toLowerCase().includes(p2));
+        }
+
+        // If specific period match wasn't found by label, compare first two distinct periods
+        if (!fact1 || !fact2) {
+            if (metricFacts.length >= 2) {
+                fact1 = metricFacts[0];
+                fact2 = metricFacts[1];
+            }
+        }
+
+        if (fact1 && fact2 && fact1.FactId !== fact2.FactId) {
+            const v1 = parseFloat(fact1.NumericValue);
+            const v2 = parseFloat(fact2.NumericValue);
+            const diff = Number((v2 - v1).toFixed(4));
+            let pct = null;
+            if (v1 !== 0) {
+                pct = Number((((v2 - v1) / Math.abs(v1)) * 100).toFixed(2));
+            }
+
+            comparisons.push({
+                type: 'PERIOD_COMPARISON',
+                metric,
+                period1: fact1.PeriodLabel || period1 || 'Period 1',
+                period1Value: v1,
+                period2: fact2.PeriodLabel || period2 || 'Period 2',
+                period2Value: v2,
+                difference: diff,
+                percentChange: pct,
+                currency: fact1.Currency || fact2.Currency || 'USD',
+                direction: diff > 0 ? 'Increase' : (diff < 0 ? 'Decrease' : 'Unchanged')
+            });
+        }
+    }
+
+    return comparisons;
+}
+
+function evaluateDeterministicCalculations(question, facts = [], intentContext = null) {
     if (!facts || facts.length === 0) return [];
     const q = question.toLowerCase();
     const calculations = [];
 
-    // 1. Gateway vs Settlement Discrepancy
-    const isDiscrepancyQuery = q.includes('mismatch') || q.includes('discrepancy') || q.includes('difference') || q.includes('gateway') || q.includes('settlement');
-    if (isDiscrepancyQuery) {
-        const gwFacts = facts.filter(f => /gateway/i.test(f.Metric));
-        const setFacts = facts.filter(f => /settlement/i.test(f.Metric) && !/summary/i.test(f.Metric));
-
-        for (const gw of gwFacts) {
-            const matchSet = setFacts.find(s => s.Entity === gw.Entity);
-            if (matchSet) {
-                const calc = computeReconciliationDiscrepancy(gw, matchSet);
-                if (calc) calculations.push(calc);
-            }
+    // 1. Explicit multi-period comparison if intent requested comparison
+    if (intentContext && intentContext.isComparison && intentContext.periods && intentContext.periods.length >= 2) {
+        const periodCalcs = computePeriodComparison(facts, intentContext.periods[0], intentContext.periods[1]);
+        if (periodCalcs.length > 0) {
+            calculations.push(...periodCalcs);
         }
     }
 
-    // 2. Component breakdowns (Approved + Declined + Pending vs Total)
-    const isSumQuery = q.includes('total') || q.includes('sum') || q.includes('aggregate') || q.includes('all transactions');
+    // 2. Gateway vs Settlement Discrepancy
+    const isDiscrepancyQuery = q.includes('mismatch') || q.includes('discrepancy') || q.includes('difference') || q.includes('gateway') || q.includes('settlement');
+    if (isDiscrepancyQuery) {
+        const gwFacts = facts.filter(f => /gateway/i.test(f.Metric));
+        const setFacts = facts.filter(f => /settlement/i.test(f.Metric) || (/transaction amount/i.test(f.Metric) && f.Entity === 'Approved'));
+
+        if (gwFacts.length > 0 && setFacts.length > 0) {
+            const discCalc = computeReconciliationDiscrepancy(gwFacts[0], setFacts[0]);
+            if (discCalc) calculations.push(discCalc);
+        }
+    }
+
+    // 3. Category Sum vs Stated Total
+    const isSumQuery = q.includes('sum') || q.includes('total') || q.includes('breakdown') || q.includes('categories') || q.includes('components');
     if (isSumQuery) {
         const countComponents = facts.filter(f => f.Metric === 'Transaction Count' && ['Approved', 'Declined', 'Pending'].includes(f.Entity));
         const totalCount = facts.find(f => f.Metric === 'Transaction Count' && f.Entity === 'All Transactions');
         if (countComponents.length > 0) {
-            const sumCalc = computeCategorySum(countComponents, totalCount);
-            if (sumCalc) calculations.push(sumCalc);
+            const countSumCalc = computeCategorySum(countComponents, totalCount);
+            if (countSumCalc) calculations.push(countSumCalc);
         }
 
         const amountComponents = facts.filter(f => f.Metric === 'Transaction Amount' && ['Approved', 'Declined', 'Pending'].includes(f.Entity));
@@ -127,9 +196,9 @@ function evaluateDeterministicCalculations(question, facts = []) {
         }
     }
 
-    // 3. Period-over-period or multi-source variance
+    // 4. Period-over-period or multi-source variance fallback
     const isVarianceQuery = q.includes('variance') || q.includes('growth') || q.includes('compare') || q.includes('change') || q.includes('increase') || q.includes('decrease');
-    if (isVarianceQuery) {
+    if (isVarianceQuery && calculations.length === 0) {
         const groups = new Map();
         for (const f of facts) {
             if (f.NumericValue !== null) {
@@ -154,5 +223,6 @@ module.exports = {
     computeVariance,
     computeCategorySum,
     computeReconciliationDiscrepancy,
+    computePeriodComparison,
     evaluateDeterministicCalculations
 };

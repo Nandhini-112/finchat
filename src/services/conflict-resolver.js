@@ -1,6 +1,13 @@
 const { areValuesEqual } = require('./unit-normalizer');
 const { getPool } = require('./sql');
 
+/**
+ * Detect and resolve conflicts across documents for the same metric, entity, and period.
+ * Rules:
+ * 1. Authority rank priority: Audited Financials (Rank 1) > Board Packs / Final (Rank 2) > Drafts (Rank 3) > Sample/Test (Rank 4).
+ * 2. If ranks differ: Higher authority is adopted as authoritative; status = 'Resolved (Higher Authority Adopted)'.
+ * 3. If ranks are EQUAL: Flags as 'Unresolved - Review Required' rather than arbitrarily picking one.
+ */
 async function detectAndResolveConflicts(documentId = null) {
     const pool = await getPool();
 
@@ -19,6 +26,7 @@ async function detectAndResolveConflicts(documentId = null) {
     const result = await pool.request().query(query);
     const allFacts = result.recordset;
 
+    // Group facts by metric + entity + period
     const grouped = new Map();
     for (const f of allFacts) {
         const key = `${(f.Metric || '').trim().toLowerCase()}|${(f.Entity || 'global').trim().toLowerCase()}|${(f.PeriodLabel || 'general').trim().toLowerCase()}`;
@@ -31,35 +39,64 @@ async function detectAndResolveConflicts(documentId = null) {
     for (const [, factsInGroup] of grouped.entries()) {
         if (factsInGroup.length < 2) continue;
 
+        // Sort ascending by authority rank (Rank 1 is highest authority)
         factsInGroup.sort((a, b) => (a.AuthorityRank || 4) - (b.AuthorityRank || 4));
-        const authoritative = factsInGroup[0];
+        const highestAuthFact = factsInGroup[0];
 
         for (let i = 1; i < factsInGroup.length; i++) {
-            const comparison = factsInGroup[i];
-            if (authoritative.DocumentId === comparison.DocumentId) continue;
+            const comparisonFact = factsInGroup[i];
+            if (highestAuthFact.DocumentId === comparisonFact.DocumentId) continue;
 
-            const isIdentical = areValuesEqual(authoritative.NumericValue, comparison.NumericValue);
+            const isIdentical = areValuesEqual(highestAuthFact.NumericValue, comparisonFact.NumericValue);
 
             if (!isIdentical) {
-                const diff = (comparison.NumericValue - authoritative.NumericValue).toFixed(2);
-                const reason = `Mismatch for ${authoritative.Metric} (${authoritative.Entity || 'Global'}): ${authoritative.NumericValue} (${authoritative.AuthorityType || 'Rank ' + authoritative.AuthorityRank}) vs ${comparison.NumericValue} (${comparison.AuthorityType || 'Rank ' + comparison.AuthorityRank}). Variance: ${diff}`;
+                const diff = Number((comparisonFact.NumericValue - highestAuthFact.NumericValue).toFixed(4));
+                const rank1 = highestAuthFact.AuthorityRank || 4;
+                const rank2 = comparisonFact.AuthorityRank || 4;
+
+                let resolutionStatus = 'Resolved';
+                let resolutionNotes = '';
+
+                if (rank1 < rank2) {
+                    // Different ranks: Highest authority wins
+                    resolutionStatus = 'Resolved (Higher Authority Adopted)';
+                    resolutionNotes = `Discrepancy for ${highestAuthFact.Metric}: Adopted ${highestAuthFact.AuthorityType || 'Rank ' + rank1} from "${highestAuthFact.SourceFileName}" (${highestAuthFact.NumericValue} ${highestAuthFact.Currency}) over lower-authority ${comparisonFact.AuthorityType || 'Rank ' + rank2} from "${comparisonFact.SourceFileName}" (${comparisonFact.NumericValue} ${comparisonFact.Currency}). Difference: ${diff}.`;
+                } else {
+                    // Equal ranks: DO NOT pick one; flag for review
+                    resolutionStatus = 'Unresolved - Review Required';
+                    resolutionNotes = `Equal-rank disagreement for ${highestAuthFact.Metric}: "${highestAuthFact.SourceFileName}" reports ${highestAuthFact.NumericValue} ${highestAuthFact.Currency} while "${comparisonFact.SourceFileName}" reports ${comparisonFact.NumericValue} ${comparisonFact.Currency} (both hold ${highestAuthFact.AuthorityType || 'Rank ' + rank1}). Flagged for human review. Difference: ${diff}.`;
+                }
 
                 await pool.request()
-                    .input('F1', authoritative.FactId)
-                    .input('F2', comparison.FactId)
-                    .input('Reason', reason)
+                    .input('F1', highestAuthFact.FactId)
+                    .input('F2', comparisonFact.FactId)
+                    .input('Reason', `Value mismatch: ${highestAuthFact.NumericValue} vs ${comparisonFact.NumericValue}`)
+                    .input('Status', resolutionStatus)
+                    .input('Notes', resolutionNotes)
                     .query(`
                         IF NOT EXISTS (
                             SELECT 1 FROM dbo.FactConflicts 
                             WHERE (FactId1 = @F1 AND FactId2 = @F2) OR (FactId1 = @F2 AND FactId2 = @F1)
                         )
                         BEGIN
-                            INSERT INTO dbo.FactConflicts (FactId1, FactId2, ConflictReason, ResolutionStatus, CreatedAt)
-                            VALUES (@F1, @F2, @Reason, 'Resolved', SYSUTCDATETIME());
+                            INSERT INTO dbo.FactConflicts (FactId1, FactId2, ConflictReason, ResolutionStatus, ResolutionNotes, CreatedAt)
+                            VALUES (@F1, @F2, @Reason, @Status, @Notes, SYSUTCDATETIME());
+                        END
+                        ELSE
+                        BEGIN
+                            UPDATE dbo.FactConflicts 
+                            SET ResolutionStatus = @Status, ResolutionNotes = @Notes
+                            WHERE (FactId1 = @F1 AND FactId2 = @F2) OR (FactId1 = @F2 AND FactId2 = @F1);
                         END
                     `);
 
-                detectedConflicts.push({ fact1: authoritative, fact2: comparison, reason });
+                detectedConflicts.push({
+                    fact1: highestAuthFact,
+                    fact2: comparisonFact,
+                    difference: diff,
+                    status: resolutionStatus,
+                    notes: resolutionNotes
+                });
             }
         }
     }
