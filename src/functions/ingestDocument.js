@@ -29,7 +29,29 @@ app.http('ingestDocument', {
         try {
             const contentType = (request.headers.get('content-type') || '').toLowerCase();
             let fileBuffer;
-            let fileName = request.query.get('fileName') || request.headers.get('x-filename') || null;
+            // 1. Extract parameters from query string (case-insensitive)
+            let fileName = null;
+            if (request.query) {
+                for (const [key, val] of request.query.entries()) {
+                    if (/^(filename|name|file|title)$/i.test(key) && val) {
+                        fileName = decodeURIComponent(val).trim();
+                        break;
+                    }
+                }
+            }
+
+            // 2. Check headers (x-filename, content-disposition)
+            if (!fileName) {
+                const xFn = request.headers.get('x-filename') || request.headers.get('x-file-name');
+                if (xFn) fileName = decodeURIComponent(xFn).trim();
+            }
+
+            if (!fileName) {
+                const disp = request.headers.get('content-disposition') || '';
+                const match = disp.match(/filename\*?=['"]?(?:UTF-\d['"]*)?([^;\r\n"']*)['"]?/i);
+                if (match && match[1]) fileName = decodeURIComponent(match[1]).trim();
+            }
+
             let allowedUserGroups = request.query.get('allowedUserGroups') || request.headers.get('x-user-groups') || null;
             let authorityRank = Number(request.query.get('authorityRank') || request.headers.get('x-authority-rank') || 4);
             let sourceType = request.query.get('sourceType') || request.headers.get('x-source-type') || 'ManualUpload';
@@ -62,7 +84,7 @@ app.http('ingestDocument', {
                 const jsonBody = await request.json().catch(() => null);
                 if (!jsonBody) throw new ValidationError('JSON body is malformed or empty.');
 
-                fileName = fileName || jsonBody.fileName;
+                fileName = fileName || jsonBody.fileName || jsonBody.filename;
                 allowedUserGroups = allowedUserGroups || jsonBody.allowedUserGroups || null;
                 if (jsonBody.authorityRank) authorityRank = Number(jsonBody.authorityRank);
                 if (jsonBody.sourceType) sourceType = jsonBody.sourceType;
@@ -79,7 +101,24 @@ app.http('ingestDocument', {
                 throw new ValidationError(`Unsupported Content-Type: "${contentType}". Finora AI accepts form-data, PDF/Binary, CSV, Excel (.xlsx/.xls), Text, or JSON.`);
             }
 
-            fileName = fileName || `document_${Date.now()}.pdf`;
+            // Auto-detect format and append extension if missing
+            const isPdf = fileBuffer && fileBuffer.length >= 4 && fileBuffer.toString('utf8', 0, 4) === '%PDF';
+            const isZipOrExcel = fileBuffer && fileBuffer.length >= 4 && fileBuffer.toString('hex', 0, 4) === '504b0304';
+
+            if (fileName) {
+                if (!fileName.includes('.')) {
+                    if (isPdf) fileName += '.pdf';
+                    else if (isZipOrExcel) fileName += '.xlsx';
+                    else if (contentType.includes('csv')) fileName += '.csv';
+                    else fileName += '.txt';
+                }
+            } else {
+                const timestamp = Date.now();
+                if (isPdf) fileName = `document_${timestamp}.pdf`;
+                else if (isZipOrExcel) fileName = `spreadsheet_${timestamp}.xlsx`;
+                else if (contentType.includes('csv')) fileName = `data_${timestamp}.csv`;
+                else fileName = `document_${timestamp}.txt`;
+            }
 
             // 1. Validate Document Buffer
             validateDocumentBuffer(fileBuffer, fileName);
