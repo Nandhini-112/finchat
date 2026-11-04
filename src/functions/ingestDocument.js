@@ -44,6 +44,20 @@ app.http('ingestDocument', {
                        contentType.includes('ms-excel')) {
                 const arrayBuffer = await request.arrayBuffer();
                 fileBuffer = Buffer.from(arrayBuffer);
+            } else if (contentType.includes('multipart/form-data')) {
+                const formData = await request.formData();
+                const file = formData.get('file') || formData.get('document');
+                if (file && typeof file.arrayBuffer === 'function') {
+                    const arrayBuffer = await file.arrayBuffer();
+                    fileBuffer = Buffer.from(arrayBuffer);
+                    fileName = fileName || file.name;
+                } else {
+                    throw new ValidationError('form-data request must include a "file" or "document" field with an uploaded file.');
+                }
+                if (formData.get('fileName')) fileName = formData.get('fileName');
+                if (formData.get('allowedUserGroups')) allowedUserGroups = formData.get('allowedUserGroups');
+                if (formData.get('authorityRank')) authorityRank = Number(formData.get('authorityRank'));
+                if (formData.get('sourceType')) sourceType = formData.get('sourceType');
             } else if (contentType.includes('application/json')) {
                 const jsonBody = await request.json().catch(() => null);
                 if (!jsonBody) throw new ValidationError('JSON body is malformed or empty.');
@@ -62,7 +76,7 @@ app.http('ingestDocument', {
                     throw new ValidationError('JSON request must include "text", "content", or "base64".');
                 }
             } else {
-                throw new ValidationError(`Unsupported Content-Type: "${contentType}". Finora AI accepts Direct Text, CSV, Excel (.xlsx/.xls), PDF, or JSON.`);
+                throw new ValidationError(`Unsupported Content-Type: "${contentType}". Finora AI accepts form-data, PDF/Binary, CSV, Excel (.xlsx/.xls), Text, or JSON.`);
             }
 
             fileName = fileName || `document_${Date.now()}.pdf`;

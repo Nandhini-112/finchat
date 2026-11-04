@@ -1,6 +1,6 @@
 require('../utils/config');
 const { app } = require('@azure/functions');
-const sql = require('mssql');
+const { getPool } = require('../services/sql');
 const { sanitizeErrorMessage } = require('../utils/errors');
 
 app.http('dbHealth', {
@@ -8,45 +8,31 @@ app.http('dbHealth', {
     authLevel: 'anonymous',
     handler: async (request, context) => {
         const correlationId = `health-${Date.now()}`;
-        let probePool = null;
 
         try {
-            // 1. Configure lightweight database probe with strict 15-second timeout
-            const config = {
-                server: process.env.AZURE_SQL_SERVER,
-                database: process.env.AZURE_SQL_DATABASE,
-                user: process.env.AZURE_SQL_USER,
-                password: process.env.AZURE_SQL_PASSWORD,
-                options: {
-                    encrypt: process.env.AZURE_SQL_ENCRYPT !== 'false',
-                    trustServerCertificate: false
-                },
-                connectionTimeout: 15000,
-                requestTimeout: 15000,
-                pool: {
-                    max: 2,
-                    min: 0,
-                    idleTimeoutMillis: 10000
-                }
-            };
+            // Connect to SQL pool and automatically ensure schema
+            const pool = await getPool();
 
-            // 2. Attempt connection
-            probePool = await sql.connect(config);
+            // Fetch current database name and table list
+            const result = await pool.request().query(`
+                SELECT DB_NAME() AS databaseName;
+                SELECT name FROM sys.tables ORDER BY name;
+            `);
 
-            // 3. Execute lightweight verification query
-            const result = await probePool.request().query(
-                'SELECT DB_NAME() AS databaseName, 1 AS connected'
-            );
+            const databaseName = result.recordsets[0][0]?.databaseName || process.env.AZURE_SQL_DATABASE;
+            const tables = (result.recordsets[1] || []).map(r => r.name);
 
-            context.log(`[${correlationId}] Azure SQL health check succeeded.`);
+            context.log(`[${correlationId}] Azure SQL health check succeeded. Tables (${tables.length}): ${tables.join(', ')}`);
 
             return {
                 status: 200,
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     status: 'healthy',
-                    database: result.recordset[0].databaseName,
+                    database: databaseName,
                     connected: true,
+                    tablesFound: tables.length,
+                    tables,
                     timestamp: new Date().toISOString()
                 })
             };
@@ -66,12 +52,6 @@ app.http('dbHealth', {
                     timestamp: new Date().toISOString()
                 })
             };
-
-        } finally {
-            // 4. Always close the probe connection to free Azure SQL socket slots
-            if (probePool) {
-                await probePool.close().catch(() => {});
-            }
         }
     }
 });
