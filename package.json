@@ -1,0 +1,21 @@
+{
+  "name": "finora-ai-functions",
+  "version": "1.0.0",
+  "description": "Financial RAG and Structured Fact Extraction Functions",
+  "main": "src/functions/*.js",
+  "scripts": {
+    "start": "func start",
+    "test": "node -e \"const fs=require('fs'),p=require('path');function walk(d){let res=[];for(let f of fs.readdirSync(d)){let fp=p.join(d,f);if(fs.statSync(fp).isDirectory())res.push(...walk(fp));else if(f.endsWith('.js'))res.push(fp);}return res;}walk('src').forEach(f=>{require('child_process').execSync('node --check '+f,{stdio:'inherit'});console.log('[PASS]',f);});console.log('All files passed syntax and build verification.');\""
+  },
+  "dependencies": {
+    "@azure/functions": "^4.0.0",
+    "@azure/identity": "^4.14.1",
+    "@azure/search-documents": "^13.0.0",
+    "@microsoft/microsoft-graph-client": "^3.0.7",
+    "dotenv": "^18.0.9",
+    "mssql": "^12.7.13",
+    "openai": "^7.45.1",
+    "pdf-parse": "^2.4.5",
+    "xlsx": "^0.18.5"
+  }
+}

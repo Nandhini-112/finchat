@@ -1,0 +1,5 @@
+node_modules
+.azurite
+.env
+local.settings.json
+*.log
