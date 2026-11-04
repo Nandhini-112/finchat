@@ -90,7 +90,17 @@ async function processDocumentIngestion({
         log(`=== ${currentStep} ===`);
 
         const extractedFacts = extractFinancialFacts(normalized);
-        log(`Step 5 Output: Extracted ${extractedFacts.length} structured fact(s).`);
+        log(`Step 5 Output (Extracted Facts Count): ${extractedFacts.length}`);
+        if (extractedFacts.length > 0) {
+            const sampleLimit = Math.min(extractedFacts.length, 4);
+            log(`Step 5 Fact Samples (First ${sampleLimit}):`);
+            for (let i = 0; i < sampleLimit; i++) {
+                const f = extractedFacts[i];
+                log(`  [Fact ${i + 1}] Metric="${f.metric}", Entity="${f.entity || 'N/A'}", Value=${f.numericValue ?? f.textValue} ${f.currency || f.unit || ''}, Location="${f.sourceLocation || 'N/A'}"`);
+            }
+        } else {
+            log('Step 5 Notice: No structured financial metrics discovered in document text/tables.');
+        }
 
         // STEP 6: FACT PERSISTENCE & CONFLICT AUDITING (AZURE SQL)
         currentStep = 'STEP 6: FACT PERSISTENCE & CONFLICT AUDITING';
@@ -99,12 +109,17 @@ async function processDocumentIngestion({
         let conflicts = [];
         if (extractedFacts.length > 0) {
             const insertedCount = await insertFinancialFacts(documentId, extractedFacts, authorityRank, fileName);
-            log(`Step 6 Output: Inserted ${insertedCount.length || extractedFacts.length} row(s) into dbo.FinancialFacts.`);
+            log(`Step 6 Output (dbo.FinancialFacts): Inserted ${insertedCount.length || extractedFacts.length} row(s).`);
 
             conflicts = await detectAndResolveConflicts(documentId);
-            log(`Step 6 Output: Discovered & registered ${conflicts.length} conflict(s) in dbo.FactConflicts.`);
+            log(`Step 6 Output (dbo.FactConflicts): Discovered & registered ${conflicts.length} conflict(s).`);
+            if (conflicts.length > 0) {
+                for (const c of conflicts) {
+                    log(`  - Discrepancy on "${c.fact1?.Metric}": ${c.status} (${c.fact1?.SourceFileName}: ${c.fact1?.NumericValue} vs ${c.fact2?.SourceFileName}: ${c.fact2?.NumericValue})`);
+                }
+            }
         } else {
-            log('Step 6 Output: No structured facts extracted to insert.');
+            log('Step 6 Output: Skipped SQL fact insertion (0 facts extracted).');
         }
 
         // STEP 7: RETRIEVAL CHUNKING
@@ -112,7 +127,14 @@ async function processDocumentIngestion({
         log(`=== ${currentStep} ===`);
 
         const chunks = createChunks(normalized, fileName);
-        log(`Step 7 Output: Produced ${chunks.length} retrieval chunk(s).`);
+        log(`Step 7 Output (Created Chunks): ${chunks.length} retrieval chunk(s).`);
+        if (chunks.length > 0) {
+            log(`  - Chunk 0: ID="${chunks[0].id}", Title="${chunks[0].title}", Length=${chunks[0].content.length} chars`);
+            if (chunks.length > 1) {
+                const lastIdx = chunks.length - 1;
+                log(`  - Chunk ${lastIdx}: ID="${chunks[lastIdx].id}", Title="${chunks[lastIdx].title}", Length=${chunks[lastIdx].content.length} chars`);
+            }
+        }
 
         // STEP 8 & 9: MULTILINGUAL EMBEDDINGS & AZURE AI SEARCH INDEXING
         currentStep = 'STEP 8 & 9: MULTILINGUAL EMBEDDINGS & AZURE AI SEARCH';
@@ -121,6 +143,9 @@ async function processDocumentIngestion({
         if (chunks.length > 0) {
             const chunkTexts = chunks.map(c => `${c.title}\n${c.content}`);
             const embeddings = await generateBatchEmbeddings(chunkTexts);
+            const vectorDimensions = embeddings[0] ? embeddings[0].length : 0;
+
+            log(`Step 8 Output (Embeddings): Produced ${embeddings.length} vector(s) of ${vectorDimensions} dimensions.`);
 
             const searchIndex = process.env.AZURE_SEARCH_INDEX || 'finance-hr-documents';
             const searchDocuments = chunks.map((chunk, idx) => ({
@@ -132,7 +157,7 @@ async function processDocumentIngestion({
             }));
 
             await uploadChunks(searchDocuments);
-            log(`Step 8 & 9 Output: Uploaded ${searchDocuments.length} hybrid vector chunk(s) to search index "${searchIndex}".`);
+            log(`Step 9 Output (Azure AI Search): Uploaded ${searchDocuments.length} hybrid vector chunk(s) to index "${searchIndex}".`);
         } else {
             log('Step 8 & 9 Output: Skipped search indexing (0 chunks).');
         }
@@ -145,6 +170,7 @@ async function processDocumentIngestion({
         await completeIngestionRun(runId, 1, 0, 'Succeeded');
 
         log(`Step 10 Output: Ingestion finalized as Succeeded for DocumentId=${documentId}, RunId=${runId}.`);
+        log(`>>> INGESTION FINISHED SUCCESSFULLY <<< DocumentId=${documentId}, Facts=${extractedFacts.length}, Chunks=${chunks.length}`);
 
         return {
             status: 'success',
@@ -159,7 +185,12 @@ async function processDocumentIngestion({
         };
 
     } catch (err) {
-        errorLog(`!!! INGESTION FAILED AT [${currentStep}]: ${err.message} !!!`);
+        errorLog(`!!! INGESTION FAILED AT [${currentStep}] !!!`);
+        errorLog(`Error Name: ${err.name || 'Error'}`);
+        errorLog(`Error Message: ${err.message}`);
+        if (err.stack) {
+            errorLog(`Error Stack Trace: ${err.stack}`);
+        }
 
         if (documentId) {
             errorLog(`Rolling back partial facts and setting DocumentId=${documentId} status to 'Failed'...`);

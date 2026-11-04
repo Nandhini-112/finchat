@@ -1,10 +1,21 @@
 const { ClientSecretCredential } = require('@azure/identity');
 const { Client, ResponseType } = require('@microsoft/microsoft-graph-client');
-const { TokenCredentialAuthenticationProvider } = require('@microsoft/microsoft-graph-client/authProviders/azureTokenCredentials');
+const {
+    TokenCredentialAuthenticationProvider
+} = require('@microsoft/microsoft-graph-client/authProviders/azureTokenCredentials');
+const { randomUUID } = require('crypto');
 const { sanitizeErrorMessage } = require('../utils/errors');
 
+const GRAPH_SCOPE = 'https://graph.microsoft.com/.default';
+const GRAPH_BASE_URL = 'https://graph.microsoft.com/v1.0';
+
+const VALID_GRAPH_AUDIENCES = [
+    'https://graph.microsoft.com',
+    '00000003-0000-0000-c000-000000000000'
+];
+
 /**
- * Validates and extracts required environment variables.
+ * Validate required environment variables.
  */
 function validateQueueConfig() {
     const required = [
@@ -15,214 +26,808 @@ function validateQueueConfig() {
         'SHAREPOINT_QUEUE_LIST'
     ];
 
-    const missing = required.filter(key => !process.env[key] || !process.env[key].trim());
-    if (missing.length > 0) {
-        throw new Error(`Missing required environment variable(s): ${missing.join(', ')}`);
+    const missing = required.filter(
+        key => !process.env[key] || !process.env[key].trim()
+    );
+
+    if (missing.length) {
+        throw new Error(
+            `Missing required environment variables: ${missing.join(', ')}`
+        );
+    }
+
+    const siteUrl = process.env.SHAREPOINT_SITE_URL.trim();
+
+    let parsedUrl;
+
+    try {
+        parsedUrl = new URL(siteUrl);
+    } catch {
+        throw new Error('Invalid SHAREPOINT_SITE_URL.');
+    }
+
+    if (
+        parsedUrl.protocol !== 'https:' ||
+        !parsedUrl.hostname.toLowerCase().endsWith('.sharepoint.com') ||
+        parsedUrl.search ||
+        parsedUrl.hash
+    ) {
+        throw new Error(
+            'SHAREPOINT_SITE_URL must be a valid HTTPS SharePoint site URL.'
+        );
     }
 
     return {
         tenantId: process.env.TENANT_ID.trim(),
         clientId: process.env.CLIENT_ID.trim(),
         clientSecret: process.env.CLIENT_SECRET.trim(),
-        siteUrl: process.env.SHAREPOINT_SITE_URL.trim(),
+        siteUrl,
         queueListName: process.env.SHAREPOINT_QUEUE_LIST.trim()
     };
 }
 
 /**
- * Initializes Microsoft Graph client using @azure/identity ClientSecretCredential.
+ * Create Microsoft Entra application credential.
  */
-function getGraphClient(tenantId, clientId, clientSecret) {
+function createGraphCredential(config) {
+    return new ClientSecretCredential(
+        config.tenantId,
+        config.clientId,
+        config.clientSecret
+    );
+}
+
+/**
+ * Obtain Microsoft Graph access token.
+ */
+async function getGraphAccessToken(credential) {
     try {
-        const credential = new ClientSecretCredential(tenantId, clientId, clientSecret);
-        const authProvider = new TokenCredentialAuthenticationProvider(credential, {
-            scopes: ['https://graph.microsoft.com/.default']
-        });
-        return Client.initWithMiddleware({ authProvider });
-    } catch (err) {
-        throw new Error(`Authentication initialization failure: ${sanitizeErrorMessage(err.message)}`);
+        const tokenResponse = await credential.getToken(GRAPH_SCOPE);
+
+        if (!tokenResponse?.token) {
+            throw new Error(
+                'Microsoft Graph access token was not returned.'
+            );
+        }
+
+        return tokenResponse;
+    } catch (error) {
+        throw new Error(
+            `Graph token acquisition failed: ${sanitizeErrorMessage(error.message)}`
+        );
     }
 }
 
 /**
- * Resolves a SharePoint site from its URL using Microsoft Graph.
+ * Decode JWT claims for diagnostics.
+ *
+ * IMPORTANT:
+ * This only decodes the token for debugging.
+ * It does not validate the JWT signature.
+ * Never log the actual access token or client secret.
  */
-async function resolveSite(graphClient, siteUrl) {
-    let parsedUrl;
-    try {
-        parsedUrl = new URL(siteUrl);
-    } catch (err) {
-        throw new Error(`Site lookup failure: Invalid SHAREPOINT_SITE_URL format "${siteUrl}". ${err.message}`);
+function getTokenDiagnostics(token, config) {
+    const parts = token.split('.');
+
+    if (parts.length !== 3) {
+        throw new Error(
+            'Unexpected Microsoft Graph token format.'
+        );
     }
 
-    const hostname = parsedUrl.hostname;
-    const serverRelativePath = parsedUrl.pathname.replace(/\/+$/, '');
-    const siteResource = `/sites/${hostname}:${serverRelativePath}`;
+    let header;
+    let claims;
 
     try {
-        const site = await graphClient.api(siteResource).get();
-        if (!site || !site.id) {
-            throw new Error(`Site lookup failure: Site resource "${siteResource}" did not return a valid site ID.`);
-        }
-        return site;
-    } catch (err) {
-        const safeMsg = sanitizeErrorMessage(err.message || 'Unknown error');
-        const status = err.statusCode || err.status || 'unknown';
+        header = JSON.parse(
+            Buffer.from(parts[0], 'base64url').toString('utf8')
+        );
 
-        if (safeMsg.includes('AADSTS7000215')) {
-            throw new Error(`Authentication failure: Invalid client secret provided (AADSTS7000215). Please verify that CLIENT_SECRET contains the secret 'Value', not the 'Secret ID'.`);
-        }
-        if (safeMsg.includes('AADSTS')) {
-            throw new Error(`Authentication failure: Entra ID rejected the credential: ${safeMsg}`);
-        }
-
-        throw new Error(`Site lookup failure: Unable to resolve SharePoint site at "${siteUrl}" (Status: ${status}): ${safeMsg}`);
+        claims = JSON.parse(
+            Buffer.from(parts[1], 'base64url').toString('utf8')
+        );
+    } catch {
+        throw new Error(
+            'Unable to decode Microsoft Graph JWT claims.'
+        );
     }
+
+    const tokenClientId = claims.appid || claims.azp;
+
+    const rolesClaim =
+        claims.roles ??
+        claims.role ??
+        claims[
+        'http://schemas.microsoft.com/ws/2008/06/identity/claims/role'
+        ];
+
+    const applicationRoles = Array.isArray(rolesClaim)
+        ? rolesClaim
+        : typeof rolesClaim === 'string'
+            ? [rolesClaim]
+            : [];
+
+    return {
+        tokenType: 'JWT',
+
+        algorithm: header.alg || 'Unavailable',
+
+        tokenVersion: claims.ver || 'Unavailable',
+
+        tenantMatches: claims.tid === config.tenantId,
+
+        clientMatches: tokenClientId === config.clientId,
+
+        tenantId: claims.tid || 'Unavailable',
+
+        clientId: tokenClientId || 'Unavailable',
+
+        audience: claims.aud || 'Unavailable',
+
+        issuer: claims.iss || 'Unavailable',
+
+        identityType: claims.idtyp || 'Unavailable',
+
+        applicationRoles,
+
+        rolesClaimExists: rolesClaim !== undefined,
+
+        rolesClaimType: Array.isArray(rolesClaim)
+            ? 'array'
+            : typeof rolesClaim,
+
+        delegatedScopes: claims.scp || null,
+
+        expiresAt: claims.exp
+            ? new Date(claims.exp * 1000).toISOString()
+            : 'Unavailable',
+
+        claimNames: Object.keys(claims)
+    };
 }
 
 /**
- * Resolves the SharePoint queue list within the site.
+ * Log safe token diagnostics.
  */
-async function resolveList(graphClient, siteId, listName, siteUrl) {
-    try {
-        return await graphClient.api(`/sites/${siteId}/lists/${encodeURIComponent(listName)}`).get();
-    } catch (directErr) {
-        try {
-            const response = await graphClient.api(`/sites/${siteId}/lists`).get();
-            const lists = response.value || [];
-            const found = lists.find(
-                l => (l.displayName && l.displayName.toLowerCase() === listName.toLowerCase()) ||
-                     (l.name && l.name.toLowerCase() === listName.toLowerCase()) ||
-                     l.id === listName
+function logTokenDiagnostics(context, diagnostics) {
+    context?.log?.(
+        '========== GRAPH TOKEN DIAGNOSTICS =========='
+    );
+
+    context?.log?.(
+        `Token tenant matches: ${diagnostics.tenantMatches}`
+    );
+
+    context?.log?.(
+        `Token client ID matches: ${diagnostics.clientMatches}`
+    );
+
+    context?.log?.(
+        `Token tenant ID: ${diagnostics.tenantId}`
+    );
+
+    context?.log?.(
+        `Token client ID: ${diagnostics.clientId}`
+    );
+
+    context?.log?.(
+        `Token audience: ${diagnostics.audience}`
+    );
+
+    context?.log?.(
+        `Token issuer: ${diagnostics.issuer}`
+    );
+
+    context?.log?.(
+        `Token version: ${diagnostics.tokenVersion}`
+    );
+
+    context?.log?.(
+        `Token identity type: ${diagnostics.identityType}`
+    );
+
+    context?.log?.(
+        `Roles claim exists: ${diagnostics.rolesClaimExists}`
+    );
+
+    context?.log?.(
+        `Roles claim type: ${diagnostics.rolesClaimType}`
+    );
+
+    context?.log?.(
+        `Actual application roles: ${JSON.stringify(diagnostics.applicationRoles)}`
+    );
+
+    context?.log?.(
+        `Available JWT claim names: ${JSON.stringify(diagnostics.claimNames)}`
+    );
+
+    context?.log?.(
+        `Delegated scopes: ${diagnostics.delegatedScopes || 'None'}`
+    );
+
+    context?.log?.(
+        `Token expiry: ${diagnostics.expiresAt}`
+    );
+
+    context?.log?.(
+        '============================================'
+    );
+}
+
+/**
+ * Create Microsoft Graph SDK client.
+ */
+function getGraphClient(
+    credentialOrTenantId,
+    clientId,
+    clientSecret
+) {
+    const credential =
+        credentialOrTenantId &&
+            typeof credentialOrTenantId.getToken === 'function'
+            ? credentialOrTenantId
+            : new ClientSecretCredential(
+                credentialOrTenantId,
+                clientId,
+                clientSecret
             );
 
-            if (!found) {
-                const available = lists.map(l => `"${l.displayName || l.name}"`).join(', ');
-                throw new Error(`List lookup failure: List "${listName}" not found in site "${siteUrl}". Available lists: [${available}]`);
+    const authProvider =
+        new TokenCredentialAuthenticationProvider(
+            credential,
+            {
+                scopes: [GRAPH_SCOPE]
             }
-            return found;
-        } catch (fallbackErr) {
-            if (fallbackErr.message && fallbackErr.message.startsWith('List lookup failure:')) {
-                throw fallbackErr;
-            }
-            const safeMsg = sanitizeErrorMessage(fallbackErr.message);
-            throw new Error(`List lookup failure: Unable to query lists for site "${siteUrl}": ${safeMsg}`);
-        }
-    }
+        );
+
+    return Client.initWithMiddleware({
+        authProvider
+    });
 }
 
 /**
- * Queries SharePoint list items with ProcessingStatus eq 'Pending'.
+ * Convert SharePoint site URL into Microsoft Graph site endpoint.
+ *
+ * Example:
+ * https://idealtechlab.sharepoint.com/sites/ITL-Trainee
+ *
+ * Graph:
+ * /sites/idealtechlab.sharepoint.com:/sites/ITL-Trainee
  */
-async function getPendingQueueItems(graphClient, siteId, listId, listName) {
-    const selectFields = [
-        'Title',
-        'FileName',
-        'DriveId',
-        'DriveItemId',
-        'FilePath',
-        'FileIdentifier',
-        'FileVersion',
-        'ProcessingStatus',
-        'AuthorityRank',
-        'AllowedUserGroups'
-    ];
+function getSiteGraphPath(siteUrl) {
+    const parsedUrl = new URL(siteUrl);
+
+    const hostname = parsedUrl.hostname;
+
+    const serverRelativePath =
+        parsedUrl.pathname.replace(/\/+$/, '');
+
+    if (
+        !serverRelativePath ||
+        serverRelativePath === '/'
+    ) {
+        throw new Error(
+            'Provide the actual SharePoint site URL, not the tenant root URL.'
+        );
+    }
+
+    const encodedPath = serverRelativePath
+        .split('/')
+        .filter(Boolean)
+        .map(segment => encodeURIComponent(segment))
+        .join('/');
+
+    return `/sites/${hostname}:/${encodedPath}`;
+}
+
+/**
+ * Perform direct Microsoft Graph GET request.
+ */
+async function graphFetch(url, accessToken, context) {
+    const clientRequestId = randomUUID();
 
     let response;
+
     try {
-        response = await graphClient
-            .api(`/sites/${siteId}/lists/${listId}/items`)
-            .header('Prefer', 'HonorNonIndexedQueriesWarningMayFailRandomly')
-            .expand(`fields($select=${selectFields.join(',')})`)
-            .filter("fields/ProcessingStatus eq 'Pending'")
-            .get();
-    } catch (queryErr) {
-        if (queryErr.statusCode === 400 && queryErr.message && queryErr.message.includes('select')) {
-            try {
-                response = await graphClient
-                    .api(`/sites/${siteId}/lists/${listId}/items`)
-                    .header('Prefer', 'HonorNonIndexedQueriesWarningMayFailRandomly')
-                    .expand('fields')
-                    .filter("fields/ProcessingStatus eq 'Pending'")
-                    .get();
-            } catch (retryErr) {
-                const safeMsg = sanitizeErrorMessage(retryErr.message);
-                const status = retryErr.statusCode || retryErr.status || 'unknown';
-                const bodyStr = retryErr.body ? sanitizeErrorMessage(JSON.stringify(retryErr.body)) : '';
-                throw new Error(`Queue query failure: Failed to retrieve Pending items from list "${listName}" (Status: ${status}): ${safeMsg}${bodyStr ? ` - Details: ${bodyStr}` : ''}`);
+        response = await fetch(url, {
+            method: 'GET',
+
+            headers: {
+                Authorization: `Bearer ${accessToken}`,
+                Accept: 'application/json',
+                'client-request-id': clientRequestId,
+                'return-client-request-id': 'true'
             }
-        } else {
-            const safeMsg = sanitizeErrorMessage(queryErr.message);
-            const status = queryErr.statusCode || queryErr.status || 'unknown';
-            const bodyStr = queryErr.body ? sanitizeErrorMessage(JSON.stringify(queryErr.body)) : '';
-            throw new Error(`Queue query failure: Failed to retrieve Pending items from list "${listName}" (Status: ${status}): ${safeMsg}${bodyStr ? ` - Details: ${bodyStr}` : ''}`);
+        });
+    } catch (error) {
+        throw new Error(
+            `Graph network request failed: ${sanitizeErrorMessage(error.message)}. Client Request ID: ${clientRequestId}`
+        );
+    }
+
+    const responseText = await response.text();
+
+    let body = {};
+
+    try {
+        body = responseText
+            ? JSON.parse(responseText)
+            : {};
+    } catch {
+        body = {
+            rawResponse: responseText
+        };
+    }
+
+    const result = {
+        ok: response.ok,
+
+        status: response.status,
+
+        body,
+
+        requestId:
+            response.headers.get('request-id') ||
+            'Unavailable',
+
+        clientRequestId:
+            response.headers.get('client-request-id') ||
+            clientRequestId,
+
+        wwwAuthenticate:
+            response.headers.get('www-authenticate') ||
+            'Unavailable'
+    };
+
+    context?.log?.(
+        `Graph HTTP status: ${result.status}`
+    );
+
+    context?.log?.(
+        `Graph request ID: ${result.requestId}`
+    );
+
+    context?.log?.(
+        `Graph client request ID: ${result.clientRequestId}`
+    );
+
+    context?.log?.(
+        `Graph WWW-Authenticate: ${result.wwwAuthenticate}`
+    );
+
+    if (!result.ok) {
+        context?.log?.(
+            `Graph error response: ${JSON.stringify(
+                result.body?.error || result.body
+            )}`
+        );
+    }
+
+    return result;
+}
+
+/**
+ * Resolve SharePoint site using Graph.
+ */
+async function resolveSite(
+    graphClient,
+    siteUrl,
+    credential,
+    context
+) {
+    let sitePath;
+
+    try {
+        sitePath = getSiteGraphPath(siteUrl);
+    } catch (error) {
+        throw new Error(
+            `Invalid SharePoint site URL: ${sanitizeErrorMessage(error.message)}`
+        );
+    }
+
+    const graphUrl = `${GRAPH_BASE_URL}${sitePath}`;
+
+    context?.log?.(
+        `Configured SharePoint site: ${siteUrl}`
+    );
+
+    context?.log?.(
+        `SharePoint Graph endpoint: ${graphUrl}`
+    );
+
+    try {
+        if (credential) {
+            // Obtain a fresh token through the configured credential.
+            const tokenResponse =
+                await getGraphAccessToken(credential);
+
+            const diagnostics = getTokenDiagnostics(
+                tokenResponse.token,
+                {
+                    tenantId: process.env.TENANT_ID.trim(),
+                    clientId: process.env.CLIENT_ID.trim()
+                }
+            );
+
+            // Print safe diagnostic information.
+            logTokenDiagnostics(
+                context,
+                diagnostics
+            );
+
+            if (!diagnostics.tenantMatches) {
+                throw new Error(
+                    'Graph token tenant does not match TENANT_ID.'
+                );
+            }
+
+            if (!diagnostics.clientMatches) {
+                throw new Error(
+                    'Graph token application does not match CLIENT_ID.'
+                );
+            }
+
+            if (
+                !VALID_GRAPH_AUDIENCES.includes(
+                    diagnostics.audience
+                )
+            ) {
+                throw new Error(
+                    `Unexpected Graph token audience: ${diagnostics.audience}`
+                );
+            }
+
+            // This is the actual authorization test.
+            // Do not rely only on decoded JWT claims.
+            const result = await graphFetch(
+                graphUrl,
+                tokenResponse.token,
+                context
+            );
+
+            if (!result.ok) {
+                const graphError =
+                    result.body?.error || {};
+
+                throw new Error(
+                    `Microsoft Graph site lookup failed. ` +
+                    `HTTP Status: ${result.status}; ` +
+                    `Code: ${graphError.code || 'Unknown'}; ` +
+                    `Message: ${sanitizeErrorMessage(
+                        graphError.message ||
+                        'No Graph error message'
+                    )}; ` +
+                    `Request ID: ${result.requestId}; ` +
+                    `Client Request ID: ${result.clientRequestId}; ` +
+                    `WWW-Authenticate: ${sanitizeErrorMessage(
+                        result.wwwAuthenticate
+                    )}`
+                );
+            }
+
+            if (!result.body?.id) {
+                throw new Error(
+                    'Graph returned success but no SharePoint site ID.'
+                );
+            }
+
+            context?.log?.(
+                `SharePoint site resolved successfully: ${result.body.displayName ||
+                result.body.name ||
+                result.body.id
+                }`
+            );
+
+            return result.body;
         }
+
+        // Fallback: use Graph SDK authentication provider.
+        const site = await graphClient
+            .api(sitePath)
+            .get();
+
+        if (!site?.id) {
+            throw new Error(
+                'Graph did not return a valid SharePoint site ID.'
+            );
+        }
+
+        return site;
+
+    } catch (error) {
+        throw new Error(
+            `Site lookup failure: Unable to resolve SharePoint site at "${siteUrl}". ${sanitizeErrorMessage(error.message)}`
+        );
     }
-
-    const items = (response && response.value) || [];
-
-    return items.map(item => {
-        const fields = item.fields || {};
-        const getVal = (name) => {
-            if (fields[name] !== undefined && fields[name] !== null) {
-                return fields[name];
-            }
-            const lower = name.toLowerCase();
-            const matchedKey = Object.keys(fields).find(k => k.toLowerCase() === lower);
-            return (matchedKey && fields[matchedKey] !== undefined && fields[matchedKey] !== null)
-                ? fields[matchedKey]
-                : '';
-        };
-
-        return {
-            id: item.id,
-            Title: getVal('Title'),
-            FileName: getVal('FileName'),
-            DriveId: getVal('DriveId'),
-            DriveItemId: getVal('DriveItemId'),
-            FilePath: getVal('FilePath'),
-            FileIdentifier: getVal('FileIdentifier'),
-            FileVersion: getVal('FileVersion'),
-            ProcessingStatus: getVal('ProcessingStatus'),
-            AuthorityRank: Number(getVal('AuthorityRank')) || 4,
-            AllowedUserGroups: getVal('AllowedUserGroups') || null
-        };
-    });
 }
 
 /**
- * Downloads binary buffer of a file from SharePoint Drive using Microsoft Graph.
+ * Resolve queue list by display name or internal name.
  */
-async function downloadDriveItemBuffer(graphClient, driveId, driveItemId) {
+async function resolveList(
+    graphClient,
+    siteId,
+    listName,
+    siteUrl
+) {
+    try {
+        const response = await graphClient
+            .api(`/sites/${siteId}/lists`)
+            .top(200)
+            .get();
+
+        const lists = response.value || [];
+
+        const found = lists.find(list =>
+            (list.displayName || '')
+                .toLowerCase() === listName.toLowerCase() ||
+
+            (list.name || '')
+                .toLowerCase() === listName.toLowerCase() ||
+
+            list.id === listName
+        );
+
+        if (!found) {
+            const available = lists
+                .map(list =>
+                    `"${list.displayName || list.name}"`
+                )
+                .join(', ');
+
+            throw new Error(
+                `Queue list "${listName}" was not found in "${siteUrl}". Available lists: [${available}]`
+            );
+        }
+
+        return found;
+
+    } catch (error) {
+        throw new Error(
+            `List lookup failure: ${sanitizeErrorMessage(error.message)}`
+        );
+    }
+}
+
+/**
+ * Retrieve all pages from a Graph collection.
+ */
+async function getAllPages(graphClient, request) {
+    let response = await request.get();
+
+    const results = [
+        ...(response.value || [])
+    ];
+
+    while (response['@odata.nextLink']) {
+        response = await graphClient
+            .api(response['@odata.nextLink'])
+            .get();
+
+        results.push(
+            ...(response.value || [])
+        );
+    }
+
+    return results;
+}
+
+/**
+ * Read a SharePoint field safely.
+ */
+function getField(fields, name) {
+    if (!fields) {
+        return '';
+    }
+
+    if (
+        fields[name] !== undefined &&
+        fields[name] !== null
+    ) {
+        return fields[name];
+    }
+
+    const matchedKey = Object.keys(fields).find(
+        key => key.toLowerCase() === name.toLowerCase()
+    );
+
+    return matchedKey &&
+        fields[matchedKey] !== undefined &&
+        fields[matchedKey] !== null
+        ? fields[matchedKey]
+        : '';
+}
+
+/**
+ * Retrieve Pending queue items.
+ */
+async function getPendingQueueItems(
+    graphClient,
+    siteId,
+    listId,
+    listName
+) {
+    let items;
+
+    try {
+        items = await getAllPages(
+            graphClient,
+
+            graphClient
+                .api(
+                    `/sites/${siteId}/lists/${listId}/items`
+                )
+                .expand('fields')
+                .top(200)
+        );
+
+    } catch (error) {
+        throw new Error(
+            `Queue query failure: Unable to retrieve items from "${listName}". ${sanitizeErrorMessage(error.message)}`
+        );
+    }
+
+    return items
+        .map(item => {
+            const fields = item.fields || {};
+
+            return {
+                id: item.id,
+
+                Title: getField(fields, 'Title'),
+
+                FileName:
+                    getField(fields, 'FileName') ||
+                    getField(fields, 'Title'),
+
+                DriveId: getField(fields, 'DriveId'),
+
+                DriveItemId: getField(fields, 'DriveItemId'),
+
+                FilePath: getField(fields, 'FilePath'),
+
+                FileIdentifier: getField(fields, 'FileIdentifier'),
+
+                FileVersion: getField(fields, 'FileVersion'),
+
+                ProcessingStatus: getField(
+                    fields,
+                    'ProcessingStatus'
+                ),
+
+                AuthorityRank:
+                    Number(
+                        getField(fields, 'AuthorityRank')
+                    ) || 4,
+
+                AllowedUserGroups:
+                    getField(fields, 'AllowedUserGroups') ||
+                    null
+            };
+        })
+        .filter(item =>
+            String(item.ProcessingStatus)
+                .trim()
+                .toLowerCase() === 'pending'
+        );
+}
+
+/**
+ * Download actual file bytes from SharePoint.
+ */
+async function downloadDriveItemBuffer(
+    graphClient,
+    driveId,
+    driveItemId
+) {
     if (!driveId || !driveItemId) {
-        throw new Error('Both driveId and driveItemId are required to download file content.');
+        throw new Error(
+            'Both driveId and driveItemId are required.'
+        );
     }
-    const endpoint = `/drives/${driveId}/items/${driveItemId}/content`;
-    const arrayBuffer = await graphClient.api(endpoint).responseType(ResponseType.ARRAYBUFFER).get();
-    return Buffer.from(arrayBuffer);
+
+    try {
+        const endpoint =
+            `/drives/${encodeURIComponent(driveId)}` +
+            `/items/${encodeURIComponent(driveItemId)}/content`;
+
+        const arrayBuffer = await graphClient
+            .api(endpoint)
+            .responseType(ResponseType.ARRAYBUFFER)
+            .get();
+
+        const buffer = Buffer.from(arrayBuffer);
+
+        if (!buffer.length) {
+            throw new Error(
+                'Downloaded SharePoint file is empty.'
+            );
+        }
+
+        return buffer;
+
+    } catch (error) {
+        throw new Error(
+            `SharePoint file download failure: ${sanitizeErrorMessage(error.message)}`
+        );
+    }
 }
 
 /**
- * Updates a SharePoint list item's ProcessingStatus and ErrorSummary.
+ * Update SharePoint queue item status.
  */
-async function updateQueueItemStatus(graphClient, siteId, listId, listItemId, status, errorSummary = '') {
-    const endpoint = `/sites/${siteId}/lists/${listId}/items/${listItemId}/fields`;
-    await graphClient.api(endpoint).patch({
-        ProcessingStatus: status,
-        ErrorSummary: errorSummary ? String(errorSummary).slice(0, 500) : ''
-    });
+
+async function updateQueueItemStatus(
+    graphClient,
+    siteId,
+    listId,
+    listItemId,
+    status,
+    errorSummary = ''
+) {
+    if (!status) {
+        throw new Error('ProcessingStatus is required.');
+    }
+
+    try {
+        const endpoint =
+            `/sites/${siteId}/lists/${listId}` +
+            `/items/${listItemId}/fields`;
+
+        await graphClient.api(endpoint).patch({
+            ProcessingStatus: status
+        });
+
+    } catch (error) {
+        throw new Error(
+            `SharePoint queue status update failure: ${sanitizeErrorMessage(error.message)}`
+        );
+    }
 }
 
 /**
- * Main coordinator function to validate, authenticate, resolve site and list,
- * and read pending items from the SharePoint queue.
+ * Main SharePoint queue coordinator.
  */
 async function readPendingQueueItems(context) {
     const config = validateQueueConfig();
-    const graphClient = getGraphClient(config.tenantId, config.clientId, config.clientSecret);
-    const site = await resolveSite(graphClient, config.siteUrl);
-    const list = await resolveList(graphClient, site.id, config.queueListName, config.siteUrl);
-    const items = await getPendingQueueItems(graphClient, site.id, list.id, config.queueListName);
+
+    const credential = createGraphCredential(config);
+
+    const graphClient = getGraphClient(credential);
+
+    // Step 1: Resolve SharePoint site.
+    const site = await resolveSite(
+        graphClient,
+        config.siteUrl,
+        credential,
+        context
+    );
+
+    // Step 2: Resolve queue list.
+    const list = await resolveList(
+        graphClient,
+        site.id,
+        config.queueListName,
+        config.siteUrl
+    );
+
+    context?.log?.(
+        `SharePoint queue list resolved: ${list.displayName || list.name
+        }`
+    );
+
+    // Step 3: Retrieve Pending items.
+    const items = await getPendingQueueItems(
+        graphClient,
+        site.id,
+        list.id,
+        config.queueListName
+    );
+
+    context?.log?.(
+        `Pending SharePoint queue items found: ${items.length}`
+    );
 
     return {
         config,
@@ -235,7 +840,12 @@ async function readPendingQueueItems(context) {
 
 module.exports = {
     validateQueueConfig,
+    createGraphCredential,
+    getGraphAccessToken,
+    getTokenDiagnostics,
+    logTokenDiagnostics,
     getGraphClient,
+    getSiteGraphPath,
     resolveSite,
     resolveList,
     getPendingQueueItems,

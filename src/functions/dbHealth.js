@@ -40,6 +40,9 @@ app.http('dbHealth', {
         } catch (error) {
             const safeMsg = sanitizeErrorMessage(error.message);
             context.error(`[${correlationId}] Azure SQL health check failed: ${safeMsg}`);
+            if (error.stack) {
+                context.error(`[${correlationId}] Health check stack trace: ${error.stack}`);
+            }
 
             return {
                 status: 503,
