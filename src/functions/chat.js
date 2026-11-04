@@ -189,7 +189,8 @@ app.http('chat', {
                 context.log(`[${correlationId}] Step 2B: Searching Azure AI Search index "finance-hr-documents"...`);
                 const chunks = await searchSimilar(queryVector, {
                     top: 4,
-                    filter: searchFilter
+                    filter: searchFilter,
+                    searchText: question
                 });
                 context.log(`[${correlationId}] Step 2B Output: Retrieved ${chunks.length} matching search chunk(s).`);
 

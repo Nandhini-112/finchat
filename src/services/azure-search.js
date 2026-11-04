@@ -41,9 +41,10 @@ async function searchSimilar(queryVector, options = {}) {
     const client = getSearchClient();
     const top = options.top || 4;
     const filter = options.filter || undefined;
+    const searchText = (options.searchText || options.queryText || '*').trim();
 
     try {
-        const searchResults = await client.search('*', {
+        const searchResults = await client.search(searchText, {
             vectors: [
                 {
                     value: queryVector,

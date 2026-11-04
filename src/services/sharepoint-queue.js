@@ -1,5 +1,5 @@
 const { ClientSecretCredential } = require('@azure/identity');
-const { Client } = require('@microsoft/microsoft-graph-client');
+const { Client, ResponseType } = require('@microsoft/microsoft-graph-client');
 const { TokenCredentialAuthenticationProvider } = require('@microsoft/microsoft-graph-client/authProviders/azureTokenCredentials');
 const { sanitizeErrorMessage } = require('../utils/errors');
 
@@ -46,7 +46,6 @@ function getGraphClient(tenantId, clientId, clientSecret) {
 
 /**
  * Resolves a SharePoint site from its URL using Microsoft Graph.
- * Endpoint: /sites/{hostname}:{server-relative-path}
  */
 async function resolveSite(graphClient, siteUrl) {
     let parsedUrl;
@@ -86,10 +85,8 @@ async function resolveSite(graphClient, siteUrl) {
  */
 async function resolveList(graphClient, siteId, listName, siteUrl) {
     try {
-        // Direct lookup by list name or ID
         return await graphClient.api(`/sites/${siteId}/lists/${encodeURIComponent(listName)}`).get();
     } catch (directErr) {
-        // Fallback: search lists by displayName or name (case-insensitive)
         try {
             const response = await graphClient.api(`/sites/${siteId}/lists`).get();
             const lists = response.value || [];
@@ -116,7 +113,6 @@ async function resolveList(graphClient, siteId, listName, siteUrl) {
 
 /**
  * Queries SharePoint list items with ProcessingStatus eq 'Pending'.
- * Uses Microsoft Graph OData filtering on fields: fields/ProcessingStatus eq 'Pending'.
  */
 async function getPendingQueueItems(graphClient, siteId, listId, listName) {
     const selectFields = [
@@ -127,7 +123,9 @@ async function getPendingQueueItems(graphClient, siteId, listId, listName) {
         'FilePath',
         'FileIdentifier',
         'FileVersion',
-        'ProcessingStatus'
+        'ProcessingStatus',
+        'AuthorityRank',
+        'AllowedUserGroups'
     ];
 
     let response;
@@ -139,7 +137,6 @@ async function getPendingQueueItems(graphClient, siteId, listId, listName) {
             .filter("fields/ProcessingStatus eq 'Pending'")
             .get();
     } catch (queryErr) {
-        // If nested $select failed due to schema differences, attempt expand without nested select
         if (queryErr.statusCode === 400 && queryErr.message && queryErr.message.includes('select')) {
             try {
                 response = await graphClient
@@ -186,8 +183,33 @@ async function getPendingQueueItems(graphClient, siteId, listId, listName) {
             FilePath: getVal('FilePath'),
             FileIdentifier: getVal('FileIdentifier'),
             FileVersion: getVal('FileVersion'),
-            ProcessingStatus: getVal('ProcessingStatus')
+            ProcessingStatus: getVal('ProcessingStatus'),
+            AuthorityRank: Number(getVal('AuthorityRank')) || 4,
+            AllowedUserGroups: getVal('AllowedUserGroups') || null
         };
+    });
+}
+
+/**
+ * Downloads binary buffer of a file from SharePoint Drive using Microsoft Graph.
+ */
+async function downloadDriveItemBuffer(graphClient, driveId, driveItemId) {
+    if (!driveId || !driveItemId) {
+        throw new Error('Both driveId and driveItemId are required to download file content.');
+    }
+    const endpoint = `/drives/${driveId}/items/${driveItemId}/content`;
+    const arrayBuffer = await graphClient.api(endpoint).responseType(ResponseType.ARRAYBUFFER).get();
+    return Buffer.from(arrayBuffer);
+}
+
+/**
+ * Updates a SharePoint list item's ProcessingStatus and ErrorSummary.
+ */
+async function updateQueueItemStatus(graphClient, siteId, listId, listItemId, status, errorSummary = '') {
+    const endpoint = `/sites/${siteId}/lists/${listId}/items/${listItemId}/fields`;
+    await graphClient.api(endpoint).patch({
+        ProcessingStatus: status,
+        ErrorSummary: errorSummary ? String(errorSummary).slice(0, 500) : ''
     });
 }
 
@@ -196,26 +218,19 @@ async function getPendingQueueItems(graphClient, siteId, listId, listName) {
  * and read pending items from the SharePoint queue.
  */
 async function readPendingQueueItems(context) {
-    // 1. Validate environment variables
     const config = validateQueueConfig();
-
-    // 2. Authenticate
     const graphClient = getGraphClient(config.tenantId, config.clientId, config.clientSecret);
-
-    // 3. Resolve SharePoint Site
     const site = await resolveSite(graphClient, config.siteUrl);
-    if (context && context.log) {
-        context.log(`Resolved SharePoint site ID: ${site.id}`);
-    }
-
-    // 4. Resolve SharePoint Queue List
     const list = await resolveList(graphClient, site.id, config.queueListName, config.siteUrl);
-    if (context && context.log) {
-        context.log(`Resolved SharePoint list ID: ${list.id} ("${list.displayName || config.queueListName}")`);
-    }
+    const items = await getPendingQueueItems(graphClient, site.id, list.id, config.queueListName);
 
-    // 5. Query Pending items
-    return await getPendingQueueItems(graphClient, site.id, list.id, config.queueListName);
+    return {
+        config,
+        graphClient,
+        siteId: site.id,
+        listId: list.id,
+        items
+    };
 }
 
 module.exports = {
@@ -224,5 +239,7 @@ module.exports = {
     resolveSite,
     resolveList,
     getPendingQueueItems,
+    downloadDriveItemBuffer,
+    updateQueueItemStatus,
     readPendingQueueItems
 };

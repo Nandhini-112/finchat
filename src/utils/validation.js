@@ -13,10 +13,25 @@ function validateDocumentBuffer(buffer, fileName = '', maxMb = null) {
     }
 
     const fn = (fileName || '').toLowerCase();
+
+    // Explicitly reject out-of-scope files per Deviation 7 (PoC scope: PDF and Excel IFRS & HR reports)
+    if (fn.endsWith('.docx') || fn.endsWith('.doc')) {
+        throw new ValidationError('File excluded: Microsoft Word documents (.docx, .doc) are out of scope. The PoC is strictly limited to PDF and Excel (.xlsx, .xls) IFRS and HR reports.');
+    }
+    if (fn.endsWith('.csv')) {
+        throw new ValidationError('File excluded: CSV files are out of scope. The PoC is strictly limited to PDF and Excel (.xlsx, .xls) IFRS and HR reports.');
+    }
+    if (fn.endsWith('.png') || fn.endsWith('.jpg') || fn.endsWith('.jpeg') || fn.endsWith('.gif') || fn.endsWith('.bmp') || fn.endsWith('.tiff')) {
+        throw new ValidationError('File excluded: Image/chart files are out of scope. The PoC is strictly limited to PDF and Excel (.xlsx, .xls) IFRS and HR reports.');
+    }
+    if (fn.endsWith('.json')) {
+        throw new ValidationError('File excluded: Raw JSON files are out of scope. The PoC is strictly limited to PDF and Excel (.xlsx, .xls) IFRS and HR reports.');
+    }
+
     const isPdf = buffer.length >= 4 && buffer.toString('utf8', 0, 4) === '%PDF';
     const isZipOrXlsx = buffer.length >= 4 && buffer[0] === 0x50 && buffer[1] === 0x4B; // PK..
     const isOleOrXls = buffer.length >= 4 && buffer[0] === 0xD0 && buffer[1] === 0xCF; // OLE
-    const isTextFormat = fn.endsWith('.txt') || fn.endsWith('.md') || fn.endsWith('.csv') || fn.endsWith('.json');
+    const isTextFormat = fn.endsWith('.txt') || fn.endsWith('.md');
     const isTextBuffer = !buffer.includes(0);
 
     if (fn.endsWith('.xlsx') && !isZipOrXlsx && !isTextBuffer) {
@@ -26,7 +41,7 @@ function validateDocumentBuffer(buffer, fileName = '', maxMb = null) {
     } else if (fn.endsWith('.pdf') && !isPdf && !isTextBuffer) {
         throw new ValidationError('Invalid PDF file. Header does not match standard PDF specification.');
     } else if (!isPdf && !isZipOrXlsx && !isOleOrXls && !isTextFormat && !isTextBuffer) {
-        throw new ValidationError('Unsupported file format. Please upload PDF, Excel (.xlsx, .xls), CSV, or direct text/markdown.');
+        throw new ValidationError('Unsupported file format. The PoC is strictly limited to PDF (.pdf) and Excel (.xlsx, .xls) IFRS and HR reports.');
     }
 
     return true;

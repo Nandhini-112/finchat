@@ -12,7 +12,8 @@ const {
     completeIngestionRun,
     createDocument,
     updateDocumentStatus,
-    insertFinancialFacts
+    insertFinancialFacts,
+    deleteDocumentFacts
 } = require('../services/sql');
 const { detectAndResolveConflicts } = require('../services/conflict-resolver');
 
@@ -311,7 +312,10 @@ app.http('ingestDocument', {
             }
 
             if (documentId) {
-                context.warn(`[${correlationId}] Updating DocumentId=${documentId} status to 'Failed' in SQL...`);
+                context.warn(`[${correlationId}] Rolling back partial facts and updating DocumentId=${documentId} status to 'Failed' in SQL...`);
+                await deleteDocumentFacts(documentId).catch(e => {
+                    context.error(`[${correlationId}] Failed to delete partial facts: ${e.message}`);
+                });
                 await updateDocumentStatus(documentId, 'Failed').catch(e => {
                     context.error(`[${correlationId}] Failed to update document status in SQL: ${e.message}`);
                 });

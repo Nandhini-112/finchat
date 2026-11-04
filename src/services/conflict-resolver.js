@@ -21,6 +21,7 @@ async function detectAndResolveConflicts(documentId = null) {
         JOIN dbo.Documents d ON f.DocumentId = d.DocumentId
         LEFT JOIN dbo.SourceAuthorityRanks r ON ISNULL(f.AuthorityRank, d.AuthorityRank) = r.AuthorityRank
         WHERE f.NumericValue IS NOT NULL
+          AND (d.IngestionStatus = 'Succeeded' OR d.IngestionStatus IS NULL)
     `;
 
     const result = await pool.request().query(query);
@@ -117,12 +118,13 @@ async function getFactsWithConflictContext(documentId = null) {
         FROM dbo.FinancialFacts f
         JOIN dbo.Documents d ON f.DocumentId = d.DocumentId
         LEFT JOIN dbo.SourceAuthorityRanks r ON ISNULL(f.AuthorityRank, d.AuthorityRank) = r.AuthorityRank
+        WHERE (d.IngestionStatus = 'Succeeded' OR d.IngestionStatus IS NULL)
     `;
 
     if (documentId) {
         const numId = Number(documentId);
         if (!isNaN(numId) && numId > 0) {
-            query += ` WHERE f.DocumentId = ${numId}`;
+            query += ` AND f.DocumentId = ${numId}`;
         }
     }
 

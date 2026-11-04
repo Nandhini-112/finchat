@@ -5,25 +5,40 @@ function extractFinancialFacts(normalizedDoc) {
     const tables = normalizedDoc.tables || [];
     const fullText = normalizedDoc.fullMarkdown || '';
 
-    // Detect period label if present
+    // 1. Detect period label if present
     let periodLabel = 'Not specified';
-    const periodMatch = fullText.match(/(?:reporting\s+period:\s*([^\n\r]+)|(\d{1,2}\s+[A-Za-z]+\s+\d{4}\s+to\s+\d{1,2}\s+[A-Za-z]+\s+\d{4}))/i);
+    const periodMatch = fullText.match(/(?:reporting\s+period:\s*([^\n\r]+)|(\d{1,2}\s+[A-Za-z]+\s+\d{4}\s+to\s+\d{1,2}\s+[A-Za-z]+\s+\d{4})|(?:period|الفترة):\s*([^\n\r]+))/i);
     if (periodMatch) {
-        periodLabel = (periodMatch[1] || periodMatch[2] || '').trim();
+        periodLabel = (periodMatch[1] || periodMatch[2] || periodMatch[3] || '').trim();
     }
 
-    // Detect document-wide currency
-    let docCurrency = 'USD';
-    if (/currency:\s*inr|₹/i.test(fullText)) docCurrency = 'INR';
-    else if (/currency:\s*eur|€/i.test(fullText)) docCurrency = 'EUR';
-    else if (/currency:\s*gbp|£/i.test(fullText)) docCurrency = 'GBP';
+    // 2. Detect As-Of Date
+    let asOfDate = null;
+    const asOfMatch = fullText.match(/(?:as\s+of|as\s+at|dated?|تاريخ):\s*(\d{1,2}[-\/]\d{1,2}[-\/]\d{2,4}|\d{4}[-\/]\d{1,2}[-\/]\d{1,2}|[A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]+\s+\d{4})/i);
+    if (asOfMatch) {
+        const parsed = new Date(asOfMatch[1]);
+        if (!isNaN(parsed.getTime())) {
+            asOfDate = parsed.toISOString().split('T')[0];
+        }
+    }
 
-    // 1. Process Structured Tables (Settlement & Financial Tables)
+    // 3. Detect document-wide currency
+    let docCurrency = 'USD';
+    if (/currency:\s*inr|₹|روبية/i.test(fullText)) docCurrency = 'INR';
+    else if (/currency:\s*eur|€|يورو/i.test(fullText)) docCurrency = 'EUR';
+    else if (/currency:\s*gbp|£|جنيه/i.test(fullText)) docCurrency = 'GBP';
+    else if (/currency:\s*sar|ريال/i.test(fullText)) docCurrency = 'SAR';
+    else if (/currency:\s*aed|درهم/i.test(fullText)) docCurrency = 'AED';
+
+    // -------------------------------------------------------------------------
+    // 4. Process Structured Tables (IFRS, HR & Settlement Tables)
+    // -------------------------------------------------------------------------
     for (const table of tables) {
         const headersLower = table.headers.map(h => (h || '').toLowerCase());
 
+        // Settlement table format
         const isSummaryTable = headersLower.some(h => h.includes('metric')) &&
-            headersLower.some(h => h.includes('count') || h.includes('amount'));
+                               headersLower.some(h => h.includes('count') || h.includes('amount'));
 
         if (isSummaryTable) {
             const metricIdx = headersLower.findIndex(h => h.includes('metric'));
@@ -50,6 +65,7 @@ function extractFinancialFacts(normalizedDoc) {
                         metric: 'Transaction Count',
                         entity,
                         periodLabel,
+                        asOfDate,
                         numericValue: countNorm.numericValue,
                         unit: 'count',
                         currency: null,
@@ -63,6 +79,7 @@ function extractFinancialFacts(normalizedDoc) {
                         metric: 'Transaction Amount',
                         entity,
                         periodLabel,
+                        asOfDate,
                         numericValue: amountNorm.numericValue,
                         unit: 'amount',
                         currency: amountNorm.currency || docCurrency,
@@ -71,10 +88,58 @@ function extractFinancialFacts(normalizedDoc) {
                     });
                 }
             }
+        } else if (table.headers && table.headers.length >= 2) {
+            // General multi-column financial / HR table (Excel sheets, IFRS statements, headcount/salaries)
+            const labelColIdx = 0;
+            for (const row of table.rows) {
+                const rowLabel = (row.rawValues[labelColIdx] || '').trim();
+                if (!rowLabel || rowLabel.length < 2) continue;
+                if (/^(sl\.?\s*no|#|id|index|total|subtotal)$/i.test(rowLabel) && row.rawValues.every((v, i) => i === 0 || !v)) continue;
+
+                for (let c = 1; c < table.headers.length; c++) {
+                    const colHeader = (table.headers[c] || `Col_${c + 1}`).trim();
+                    const cellVal = row.rawValues[c];
+                    if (cellVal === undefined || cellVal === null || cellVal === '') continue;
+
+                    const norm = normalizeFinancialValue(cellVal);
+                    if (norm.numericValue !== null) {
+                        let colPeriod = periodLabel;
+                        if (/(\b\d{4}\b|\bQ[1-4]\b|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(colHeader)) {
+                            colPeriod = colHeader;
+                        }
+
+                        let unit = norm.unit || 'amount';
+                        const isHrMetric = /headcount|employee|employees|staff|workers|turnover\s+count|attrition|salary|salaries|عدد الموظفين|الرواتب/i.test(rowLabel) ||
+                                           /headcount|employees|count/i.test(colHeader);
+                        if (isHrMetric && !/salary|salaries|الرواتب/i.test(rowLabel)) {
+                            unit = 'count';
+                        }
+
+                        let metricName = rowLabel;
+                        if (!/col_\d+/i.test(colHeader) && !/(\b\d{4}\b|\bQ[1-4]\b)/i.test(colHeader)) {
+                            metricName = `${rowLabel} - ${colHeader}`;
+                        }
+
+                        facts.push({
+                            metric: metricName,
+                            entity: 'Consolidated',
+                            periodLabel: colPeriod,
+                            asOfDate,
+                            numericValue: norm.numericValue,
+                            unit,
+                            currency: unit === 'count' ? null : (norm.currency || docCurrency),
+                            sourceLocation: `${table.sheetName ? 'Sheet: ' + table.sheetName + '; ' : ''}Table ${table.table_id || 1}, Row ${row.rowIndex || 1}, Col: ${colHeader}`,
+                            validationStatus: 'Validated'
+                        });
+                    }
+                }
+            }
         }
     }
 
-    // 2. Process Text-Based Statements & Tabular Lines
+    // -------------------------------------------------------------------------
+    // 5. Process Text-Based Statements, Bullet Metrics & HR Reports
+    // -------------------------------------------------------------------------
     const lines = fullText.split('\n').map(l => l.trim()).filter(Boolean);
     let currentPage = 1;
 
@@ -84,19 +149,26 @@ function extractFinancialFacts(normalizedDoc) {
             currentPage = Number(pageMatch[1]);
         }
 
-        // Match bullet metrics: ● Total Revenue: ₹18,50,000  or  - Net Profit: 9,50,000
-        const bulletMatch = line.match(/^[●•\-\*]\s*([A-Za-z0-9\s]+?):\s*([₹$€£]?\s*[0-9,.]+)/i);
+        // Match bullet metrics: ● Total Revenue: ₹18,50,000 | ● Headcount: 142 | ● Attrition: 4.5%
+        const bulletMatch = line.match(/^[●•\-\*]\s*([A-Za-z0-9\sء-ي]+?):\s*([₹$€£]?\s*[0-9,.\u0660-\u0669\u06F0-\u06F9%a-zA-Z\sء-ي]+)/i);
         if (bulletMatch) {
             const rawMetric = bulletMatch[1].trim();
             const valNorm = normalizeFinancialValue(bulletMatch[2]);
             if (valNorm.numericValue !== null && rawMetric.length > 2) {
+                // Determine HR vs Financial unit
+                let unit = valNorm.unit || 'amount';
+                if (/headcount|employee|employees|staff|workers|turnover\s+count|عدد الموظفين/i.test(rawMetric)) {
+                    unit = 'count';
+                }
+
                 facts.push({
                     metric: rawMetric,
                     entity: 'Consolidated',
                     periodLabel,
+                    asOfDate,
                     numericValue: valNorm.numericValue,
-                    unit: 'amount',
-                    currency: valNorm.currency || docCurrency,
+                    unit,
+                    currency: unit === 'count' ? null : (valNorm.currency || docCurrency),
                     sourceLocation: `Page ${currentPage} - ${rawMetric}`,
                     validationStatus: 'Validated'
                 });
@@ -104,19 +176,25 @@ function extractFinancialFacts(normalizedDoc) {
             continue;
         }
 
-        // Match table rows: "Software Services 9,50,000" or "Employee Salaries 6,00,000"
-        const rowMatch = line.match(/^([A-Za-z\s]{3,35})\s+([0-9,.]+)\s*$/);
+        // Match table rows: "Software Services 9,50,000" or "Employee Salaries 6,00,000" or "Total Headcount 150"
+        const rowMatch = line.match(/^([A-Za-z0-9\sء-ي]{3,40})\s+([0-9,.\u0660-\u0669\u06F0-\u06F9]+)\s*$/);
         if (rowMatch && !/^(page|report|date|status|company|currency|category|amount|invoice|total\s+invoice)/i.test(rowMatch[1])) {
             const rawMetric = rowMatch[1].trim();
             const valNorm = normalizeFinancialValue(rowMatch[2]);
-            if (valNorm.numericValue !== null && valNorm.numericValue >= 100) {
+            if (valNorm.numericValue !== null) {
+                let unit = valNorm.unit || 'amount';
+                if (/headcount|employee|employees|staff|workers|turnover\s+count|عدد الموظفين/i.test(rawMetric)) {
+                    unit = 'count';
+                }
+
                 facts.push({
                     metric: rawMetric,
                     entity: 'Category Breakdown',
                     periodLabel,
+                    asOfDate,
                     numericValue: valNorm.numericValue,
-                    unit: 'amount',
-                    currency: valNorm.currency || docCurrency,
+                    unit,
+                    currency: unit === 'count' ? null : (valNorm.currency || docCurrency),
                     sourceLocation: `Page ${currentPage} - Table Row`,
                     validationStatus: 'Validated'
                 });
@@ -128,7 +206,7 @@ function extractFinancialFacts(normalizedDoc) {
     const seen = new Set();
     const uniqueFacts = [];
     for (const f of facts) {
-        const key = `${f.metric.toLowerCase()}::${f.numericValue}::${f.currency}`;
+        const key = `${f.metric.toLowerCase()}::${f.numericValue}::${f.currency || 'null'}`;
         if (!seen.has(key)) {
             seen.add(key);
             uniqueFacts.push(f);

@@ -293,19 +293,38 @@ async function getFinancialFacts(documentId = null) {
         FROM dbo.FinancialFacts f
         LEFT JOIN dbo.Documents d ON f.DocumentId = d.DocumentId
         LEFT JOIN dbo.SourceAuthorityRanks r ON ISNULL(f.AuthorityRank, d.AuthorityRank) = r.AuthorityRank
+        WHERE (d.IngestionStatus = 'Succeeded' OR d.IngestionStatus IS NULL)
     `;
 
     if (documentId) {
         const numId = Number(documentId);
         if (!isNaN(numId) && numId > 0) {
             req.input('DocumentId', sql.BigInt, numId);
-            query += ' WHERE f.DocumentId = @DocumentId';
+            query += ' AND f.DocumentId = @DocumentId';
         }
     }
 
     query += ' ORDER BY f.FactId ASC';
     const result = await req.query(query);
     return result.recordset;
+}
+
+/**
+ * Removes all facts and associated conflicts for a failed or retracted document.
+ * Guarantees that failed files leave zero stray facts in the database.
+ */
+async function deleteDocumentFacts(documentId) {
+    if (!documentId) return;
+    const p = await getPool();
+    await p.request()
+        .input('DocumentId', sql.BigInt, Number(documentId))
+        .query(`
+            DELETE FROM dbo.FactConflicts 
+            WHERE FactId1 IN (SELECT FactId FROM dbo.FinancialFacts WHERE DocumentId = @DocumentId)
+               OR FactId2 IN (SELECT FactId FROM dbo.FinancialFacts WHERE DocumentId = @DocumentId);
+
+            DELETE FROM dbo.FinancialFacts WHERE DocumentId = @DocumentId;
+        `);
 }
 
 module.exports = {
@@ -316,5 +335,7 @@ module.exports = {
     updateDocumentStatus,
     insertFinancialFacts,
     getDocumentById,
-    getFinancialFacts
+    getFinancialFacts,
+    deleteDocumentFacts
 };
+
