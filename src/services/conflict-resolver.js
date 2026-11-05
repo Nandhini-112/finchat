@@ -48,6 +48,12 @@ async function detectAndResolveConflicts(documentId = null) {
             const comparisonFact = factsInGroup[i];
             if (highestAuthFact.DocumentId === comparisonFact.DocumentId) continue;
 
+            // Do not flag a conflict between two records from the same file (e.g. re-ingested copies or multi-page entries)
+            if (highestAuthFact.SourceFileName && comparisonFact.SourceFileName &&
+                highestAuthFact.SourceFileName.toLowerCase() === comparisonFact.SourceFileName.toLowerCase()) {
+                continue;
+            }
+
             const isIdentical = areValuesEqual(highestAuthFact.NumericValue, comparisonFact.NumericValue);
 
             if (!isIdentical) {

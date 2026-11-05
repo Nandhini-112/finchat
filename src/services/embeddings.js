@@ -34,6 +34,8 @@ async function generateBatchEmbeddings(texts, batchSize = 10) {
     for (let i = 0; i < texts.length; i += batchSize) {
         const batch = texts.slice(i, i + batchSize).map(t => (t || '').slice(0, 8000));
         try {
+
+            //TODO: To make this create embedding as a fn and use it for both ingestion and chat
             const response = await c.embeddings.create({
                 model,
                 input: batch

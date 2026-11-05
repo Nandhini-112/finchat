@@ -181,12 +181,28 @@ function extractFinancialFacts(normalizedDoc) {
 
         // Match table rows: "Software Services 9,50,000" or "Employee Salaries 6,00,000" or "Total Headcount 150"
         const rowMatch = line.match(/^([A-Za-z0-9\sء-ي]{3,40})\s+([0-9,.\u0660-\u0669\u06F0-\u06F9]+)\s*$/);
-        if (rowMatch && !/^(page|report|date|status|company|currency|category|amount|invoice|total\s+invoice)/i.test(rowMatch[1])) {
+        if (rowMatch) {
             const rawMetric = rowMatch[1].trim();
+
+            // Ignore document structure, page headers/footers, slide numbers, and test markers
+            if (/\b(page|test\s+page|chapter|section|part|appendix|exhibit|footnote|header|footer|index|table\s+of\s+contents|صفحة|الملحق|الفصل)\b/i.test(rawMetric)) {
+                continue;
+            }
+            if (/^(page|report|date|status|company|currency|category|amount|invoice|total\s+invoice|sl\.?\s*no|#|id)\b/i.test(rawMetric)) {
+                continue;
+            }
+
             const valNorm = normalizeFinancialValue(rowMatch[2]);
             if (valNorm.numericValue !== null) {
+                // If it is a small bare integer (<= 20) with no currency, no percentage, and not matching headcount keywords,
+                // it is a page/item index or footnote reference, not a financial metric
+                const isHrCount = /headcount|employee|employees|staff|workers|turnover\s+count|عدد\s+الموظفين/i.test(rawMetric);
+                if (!valNorm.currency && valNorm.unit !== 'percentage' && !isHrCount && valNorm.numericValue <= 20) {
+                    continue;
+                }
+
                 let unit = valNorm.unit || 'amount';
-                if (/headcount|employee|employees|staff|workers|turnover\s+count|عدد الموظفين/i.test(rawMetric)) {
+                if (isHrCount) {
                     unit = 'count';
                 }
 

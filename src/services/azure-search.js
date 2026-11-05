@@ -49,12 +49,12 @@ async function searchSimilar(queryVector, options = {}) {
                 {
                     value: queryVector,
                     kNearestNeighborsCount: top,
-                    fields: ['contentVector']
+                    fields: ['contentVector'] // what is contentVector
                 }
             ],
             filter,
             top,
-            select: ['id', 'title', 'content', 'source']
+            select: ['id', 'title', 'content', 'source']//TODO: To add doc user details
         });
 
         const documents = [];
