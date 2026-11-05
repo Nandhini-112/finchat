@@ -50,14 +50,14 @@ You must respond ONLY with a raw JSON object (no markdown, no backticks, no prea
 function classifyIntentByRules(question) {
     const q = (question || '').toLowerCase();
 
-    // Check for comparison keywords
-    const isComparison = /(compare|comparison|versus|\bvs\b|difference|variance|growth|increase|decrease|change\s+between)/i.test(q);
+    // Check for comparison keywords (English & Arabic)
+    const isComparison = /(compare|comparison|versus|\bvs\b|difference|variance|growth|increase|decrease|change\s+between|مقارنة|قارن|الفرق|التباين|النمو|الزيادة|النقص)/i.test(q);
 
-    // Check for financial metric keywords
-    const isFinancialMetric = /(revenue|expense|salaries|salary|rent|profit|income|invoice|invoices|amount|count|balance|paid|unpaid|pending|ebitda|tax|taxes|turnover|cost|costs|fees|cash\s*flow|total|approved|declined)/i.test(q);
+    // Check for financial & HR metric keywords (English & Arabic)
+    const isFinancialMetric = /(revenue|expense|salaries|salary|rent|profit|income|invoice|invoices|amount|count|balance|paid|unpaid|pending|ebitda|tax|taxes|turnover|cost|costs|fees|cash\s*flow|total|approved|declined|إيرادات|ايرادات|مصروفات|مصاريف|الرواتب|أجور|اجور|الربح|الأرباح|ارباح|الدخل|المبيعات|عدد\s+الموظفين|الموظفين|الضريبة|التكلفة|تكلفة)/i.test(q);
 
-    // Extract potential period or date mentions (e.g. October 2026, Q1, FY24)
-    const periodMatches = question.match(/(?:(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4}|q[1-4](?:\s+\d{4})?|fy\s*\d{2,4}|\d{4})/gi) || [];
+    // Extract potential period or date mentions (English & Arabic e.g. October 2026, Q1, الربع الثالث, ٢٠٢٤)
+    const periodMatches = question.match(/(?:(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4}|q[1-4](?:\s+\d{4})?|fy\s*\d{2,4}|\d{4}|الربع\s+(?:الأول|الثاني|الثالث|الرابع)|٢٠\d{2})/gi) || [];
 
     if (isFinancialMetric || isComparison) {
         return {

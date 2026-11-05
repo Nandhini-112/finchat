@@ -646,7 +646,8 @@ async function getPendingQueueItems(
     graphClient,
     siteId,
     listId,
-    listName
+    listName,
+    listDriveId = null
 ) {
     let items;
 
@@ -668,7 +669,7 @@ async function getPendingQueueItems(
         );
     }
 
-    return items
+    const mappedItems = items
         .map(item => {
             const fields = item.fields || {};
 
@@ -677,15 +678,22 @@ async function getPendingQueueItems(
 
                 Title: getField(fields, 'Title'),
 
-                FileName:
-                    getField(fields, 'FileName') ||
-                    getField(fields, 'Title'),
+                FileName: (() => {
+                    const rawFn = getField(fields, 'FileName') || 
+                                  getField(fields, 'FileLeafRef') || 
+                                  getField(fields, 'Title') || '';
+                    try {
+                        return decodeURIComponent(rawFn);
+                    } catch (_) {
+                        return rawFn;
+                    }
+                })(),
 
-                DriveId: getField(fields, 'DriveId'),
+                DriveId: getField(fields, 'DriveId') || listDriveId || '',
 
                 DriveItemId: getField(fields, 'DriveItemId'),
 
-                FilePath: getField(fields, 'FilePath'),
+                FilePath: getField(fields, 'FilePath') || getField(fields, 'FileRef') || '',
 
                 FileIdentifier: getField(fields, 'FileIdentifier'),
 
@@ -711,6 +719,31 @@ async function getPendingQueueItems(
                 .trim()
                 .toLowerCase() === 'pending'
         );
+
+    // If list is a Document Library and DriveItemId was not provided as a custom column,
+    // resolve driveItem.id from Graph API for each pending item.
+    if (listDriveId && mappedItems.some(i => !i.DriveItemId)) {
+        for (const record of mappedItems) {
+            if (!record.DriveItemId) {
+                try {
+                    const di = await graphClient
+                        .api(`/sites/${siteId}/lists/${listId}/items/${record.id}/driveItem`)
+                        .select('id,name')
+                        .get();
+                    if (di?.id) {
+                        record.DriveItemId = di.id;
+                        if (!record.FileName && di.name) {
+                            record.FileName = di.name;
+                        }
+                    }
+                } catch (_) {
+                    // Item driveItem resolution failed; processDocumentQueue will report missing DriveItemId
+                }
+            }
+        }
+    }
+
+    return mappedItems;
 }
 
 /**
@@ -741,23 +774,29 @@ async function downloadDriveItemBuffer(
 
         if (!buffer.length) {
             throw new Error(
-                'Downloaded SharePoint file is empty.'
+                'Downloaded SharePoint file is empty (0 bytes).'
             );
         }
 
         return buffer;
 
     } catch (error) {
+        const safeMsg = sanitizeErrorMessage(error.message);
+        if (error.statusCode === 404 || error.status === 404 || safeMsg.toLowerCase().includes('itemnotfound')) {
+            const notFoundErr = new Error('SharePoint file not found (404): The file was moved or deleted from SharePoint.');
+            notFoundErr.statusCode = 404;
+            throw notFoundErr;
+        }
         throw new Error(
-            `SharePoint file download failure: ${sanitizeErrorMessage(error.message)}`
+            `SharePoint file download failure: ${safeMsg}`
         );
     }
 }
 
 /**
- * Update SharePoint queue item status.
+ * Update SharePoint queue item status (e.g. 'In Progress', 'Processed', 'Failed')
+ * and records truncated ErrorSummary on failure.
  */
-
 async function updateQueueItemStatus(
     graphClient,
     siteId,
@@ -775,9 +814,28 @@ async function updateQueueItemStatus(
             `/sites/${siteId}/lists/${listId}` +
             `/items/${listItemId}/fields`;
 
-        await graphClient.api(endpoint).patch({
+        const patchPayload = {
             ProcessingStatus: status
-        });
+        };
+
+        if (status === 'Failed' || errorSummary) {
+            patchPayload.ErrorSummary = errorSummary ? String(errorSummary).slice(0, 500) : '';
+        } else if (status === 'Processed' || status === 'In Progress') {
+            patchPayload.ErrorSummary = '';
+        }
+
+        try {
+            await graphClient.api(endpoint).patch(patchPayload);
+        } catch (patchErr) {
+            // Graceful fallback: If SharePoint list does not have an ErrorSummary column created yet,
+            // retry patching just ProcessingStatus so locking/status transitions never fail.
+            const errMsg = String(patchErr.message || '').toLowerCase();
+            if (patchPayload.ErrorSummary !== undefined && (errMsg.includes('errorsummary') || errMsg.includes('field') || errMsg.includes('property') || errMsg.includes('does not exist'))) {
+                await graphClient.api(endpoint).patch({ ProcessingStatus: status });
+            } else {
+                throw patchErr;
+            }
+        }
 
     } catch (error) {
         throw new Error(
@@ -817,12 +875,25 @@ async function readPendingQueueItems(context) {
         }`
     );
 
+    // If list is backed by a document library, resolve its driveId
+    let listDriveId = null;
+    try {
+        const driveRes = await graphClient.api(`/sites/${site.id}/lists/${list.id}/drive`).select('id').get();
+        if (driveRes?.id) {
+            listDriveId = driveRes.id;
+            context?.log?.(`Associated Document Library drive resolved: ${listDriveId}`);
+        }
+    } catch (_) {
+        // Normal for custom generic lists
+    }
+
     // Step 3: Retrieve Pending items.
     const items = await getPendingQueueItems(
         graphClient,
         site.id,
         list.id,
-        config.queueListName
+        config.queueListName,
+        listDriveId
     );
 
     context?.log?.(

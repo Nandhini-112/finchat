@@ -5,16 +5,16 @@ function extractFinancialFacts(normalizedDoc) {
     const tables = normalizedDoc.tables || [];
     const fullText = normalizedDoc.fullMarkdown || '';
 
-    // 1. Detect period label if present
+    // 1. Detect period label if present (English & Arabic)
     let periodLabel = 'Not specified';
-    const periodMatch = fullText.match(/(?:reporting\s+period:\s*([^\n\r]+)|(\d{1,2}\s+[A-Za-z]+\s+\d{4}\s+to\s+\d{1,2}\s+[A-Za-z]+\s+\d{4})|(?:period|الفترة):\s*([^\n\r]+))/i);
+    const periodMatch = fullText.match(/(?:reporting\s+period:\s*([^\n\r]+)|(\d{1,2}\s+[A-Za-z]+\s+\d{4}\s+to\s+\d{1,2}\s+[A-Za-z]+\s+\d{4})|(?:period|الفترة|فترة\s+التقرير|الربع):\s*([^\n\r]+))/i);
     if (periodMatch) {
         periodLabel = (periodMatch[1] || periodMatch[2] || periodMatch[3] || '').trim();
     }
 
-    // 2. Detect As-Of Date
+    // 2. Detect As-Of Date (English & Arabic)
     let asOfDate = null;
-    const asOfMatch = fullText.match(/(?:as\s+of|as\s+at|dated?|تاريخ):\s*(\d{1,2}[-\/]\d{1,2}[-\/]\d{2,4}|\d{4}[-\/]\d{1,2}[-\/]\d{1,2}|[A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]+\s+\d{4})/i);
+    const asOfMatch = fullText.match(/(?:as\s+of|as\s+at|dated?|تاريخ|كما\s+في|بتاريخ):\s*(\d{1,2}[-\/]\d{1,2}[-\/]\d{2,4}|\d{4}[-\/]\d{1,2}[-\/]\d{1,2}|[A-Za-z\u0621-\u064A]+\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z\u0621-\u064A]+\s+\d{4})/i);
     if (asOfMatch) {
         const parsed = new Date(asOfMatch[1]);
         if (!isNaN(parsed.getTime())) {
@@ -22,13 +22,16 @@ function extractFinancialFacts(normalizedDoc) {
         }
     }
 
-    // 3. Detect document-wide currency
+    // 3. Detect document-wide currency (Western & Middle-Eastern)
     let docCurrency = 'USD';
     if (/currency:\s*inr|₹|روبية/i.test(fullText)) docCurrency = 'INR';
     else if (/currency:\s*eur|€|يورو/i.test(fullText)) docCurrency = 'EUR';
-    else if (/currency:\s*gbp|£|جنيه/i.test(fullText)) docCurrency = 'GBP';
-    else if (/currency:\s*sar|ريال/i.test(fullText)) docCurrency = 'SAR';
-    else if (/currency:\s*aed|درهم/i.test(fullText)) docCurrency = 'AED';
+    else if (/currency:\s*gbp|£|جنيه\s+إسترليني/i.test(fullText)) docCurrency = 'GBP';
+    else if (/currency:\s*sar|ريال|ر\.س/i.test(fullText)) docCurrency = 'SAR';
+    else if (/currency:\s*aed|درهم|د\.إ/i.test(fullText)) docCurrency = 'AED';
+    else if (/currency:\s*egp|جنيه/i.test(fullText)) docCurrency = 'EGP';
+    else if (/currency:\s*kwd|دينار/i.test(fullText)) docCurrency = 'KWD';
+    else if (/currency:\s*usd|\$|دولار/i.test(fullText)) docCurrency = 'USD';
 
     // -------------------------------------------------------------------------
     // 4. Process Structured Tables (IFRS, HR & Settlement Tables)
@@ -104,14 +107,14 @@ function extractFinancialFacts(normalizedDoc) {
                     const norm = normalizeFinancialValue(cellVal);
                     if (norm.numericValue !== null) {
                         let colPeriod = periodLabel;
-                        if (/(\b\d{4}\b|\bQ[1-4]\b|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(colHeader)) {
+                        if (/(\b\d{4}\b|\bQ[1-4]\b|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|الربع\s+الأول|الربع\s+الثاني|الربع\s+الثالث|الربع\s+الرابع|٢٠\d{2})/i.test(colHeader)) {
                             colPeriod = colHeader;
                         }
 
                         let unit = norm.unit || 'amount';
-                        const isHrMetric = /headcount|employee|employees|staff|workers|turnover\s+count|attrition|salary|salaries|عدد الموظفين|الرواتب/i.test(rowLabel) ||
-                                           /headcount|employees|count/i.test(colHeader);
-                        if (isHrMetric && !/salary|salaries|الرواتب/i.test(rowLabel)) {
+                        const isHrMetric = /headcount|employee|employees|staff|workers|turnover\s+count|attrition|salary|salaries|عدد\s+الموظفين|الموظفين|العمالة|الرواتب|الأجور|معدل\s+الدوران/i.test(rowLabel) ||
+                                           /headcount|employees|count|عدد\s+الموظفين/i.test(colHeader);
+                        if (isHrMetric && !/salary|salaries|الرواتب|الأجور/i.test(rowLabel)) {
                             unit = 'count';
                         }
 

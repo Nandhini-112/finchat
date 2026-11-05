@@ -44,6 +44,11 @@ function validateDocumentBuffer(buffer, fileName = '', maxMb = null) {
         throw new ValidationError('Unsupported file format. The PoC is strictly limited to PDF (.pdf) and Excel (.xlsx, .xls) IFRS and HR reports.');
     }
 
+    // Detect password-protected or encrypted PDF / Excel files
+    if (isPdf && buffer.includes('/Encrypt')) {
+        throw new ValidationError('Document is encrypted or password-protected. Please upload an unencrypted version.');
+    }
+
     return true;
 }
 

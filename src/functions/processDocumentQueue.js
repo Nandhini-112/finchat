@@ -48,6 +48,25 @@ app.timer('processDocumentQueue', {
                 );
 
                 try {
+                    // Step 0: Immediate Concurrency Lock -> 'In Progress'
+                    // Prevents duplicate processing by concurrent timer invocations or scale-out instances
+                    await updateQueueItemStatus(graphClient, siteId, listId, record.id, 'In Progress');
+                    context.log(`[QueueProcessor] Item ${record.id} locked as "In Progress".`);
+
+                    // Step 0B: Validate required metadata
+                    if (!record.DriveId || !record.DriveItemId) {
+                        throw new Error('Queue item is missing required DriveId or DriveItemId from SharePoint.');
+                    }
+                    if (!record.FileName || !record.FileName.trim()) {
+                        throw new Error('Queue item has an empty or missing FileName.');
+                    }
+
+                    // Validate & sanitize Authority Rank (1 to 4)
+                    let authorityRank = Number(record.AuthorityRank);
+                    if (isNaN(authorityRank) || authorityRank < 1 || authorityRank > 4) {
+                        authorityRank = 4;
+                    }
+
                     // Step A: Download binary file content from SharePoint Drive
                     context.log(`[QueueProcessor] Downloading binary buffer from SharePoint DriveItem ${record.DriveItemId}...`);
                     const fileBuffer = await downloadDriveItemBuffer(graphClient, record.DriveId, record.DriveItemId);
@@ -58,7 +77,7 @@ app.timer('processDocumentQueue', {
                         fileBuffer,
                         fileName: record.FileName,
                         sourceType: 'SharePoint',
-                        authorityRank: record.AuthorityRank || 4,
+                        authorityRank,
                         allowedUserGroups: record.AllowedUserGroups || null,
                         correlationId: itemCorrelationId,
                         context
@@ -71,8 +90,11 @@ app.timer('processDocumentQueue', {
 
                 } catch (itemErr) {
                     context.error(`[QueueProcessor] Failed processing SharePoint file "${record.FileName}" (Item ${record.id}): ${itemErr.message}`);
+                    if (itemErr.stack) {
+                        context.error(`[QueueProcessor] Item error stack trace: ${itemErr.stack}`);
+                    }
 
-                    // Update SharePoint List Item status to 'Failed' with error summary
+                    // Update SharePoint List Item status to 'Failed' with truncated error summary
                     await updateQueueItemStatus(graphClient, siteId, listId, record.id, 'Failed', itemErr.message).catch(e => {
                         context.error(`[QueueProcessor] Failed to update item status in SharePoint: ${e.message}`);
                     });
