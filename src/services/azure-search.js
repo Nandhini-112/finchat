@@ -124,7 +124,7 @@ async function searchSimilar(queryVector, options = {}) {
                 {
                     value: queryVector,
                     kNearestNeighborsCount: top,
-                    fields: ['contentVector']
+                    fields: ['contentVector'] // what is contentVector
                 }
             ],
             filter,
