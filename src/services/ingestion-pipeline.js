@@ -6,7 +6,8 @@ const { normalizeContent } = require('./content-normalizer');
 const { extractFinancialFacts } = require('./fact-extraction');
 const { createChunks } = require('./chunking');
 const { generateBatchEmbeddings } = require('./embeddings');
-const { uploadChunks } = require('./azure-search');
+const { uploadChunks, deleteReplacedChunks } = require('./azure-search');
+const { buildSearchDocument, blankToNull } = require('./search-document');
 const {
     startIngestionRun,
     completeIngestionRun,
@@ -37,7 +38,15 @@ async function processDocumentIngestion({
     authorityRank = 4,
     allowedUserGroups = null,
     correlationId = null,
-    context = console
+    context = console,
+    documentKey = null,
+    queueKey = null,
+    documentVersionId = null,
+    fileLink = null,
+    department = null,
+    jobTitle = null,
+    modifiedDate = null,
+    authoritySource = null
 }) {
     const corrId = correlationId || `ingest-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
     const log = (msg) => (context.log ? context.log(`[${corrId}] ${msg}`) : console.log(`[${corrId}] ${msg}`));
@@ -126,7 +135,7 @@ async function processDocumentIngestion({
         currentStep = 'STEP 7: RETRIEVAL CHUNKING';
         log(`=== ${currentStep} ===`);
 
-        const chunks = createChunks(normalized, fileName);
+        const chunks = createChunks(normalized, fileName, null, null, { queueKey });
         log(`Step 7 Output (Created Chunks): ${chunks.length} retrieval chunk(s).`);
         if (chunks.length > 0) {
             log(`  - Chunk 0: ID="${chunks[0].id}", Title="${chunks[0].title}", Length=${chunks[0].content.length} chars`);
@@ -148,16 +157,31 @@ async function processDocumentIngestion({
             log(`Step 8 Output (Embeddings): Produced ${embeddings.length} vector(s) of ${vectorDimensions} dimensions.`);
 
             const searchIndex = process.env.AZURE_SEARCH_INDEX || 'finance-hr-documents';
-            const searchDocuments = chunks.map((chunk, idx) => ({
-                id: chunk.id,
-                title: chunk.title,
-                content: chunk.content,
-                source: chunk.source,
-                contentVector: embeddings[idx]
+            const searchMetadata = {
+                documentId,
+                documentVersionId: blankToNull(documentVersionId),
+                documentKey: blankToNull(documentKey),
+                queueKey: blankToNull(queueKey),
+                fileName,
+                fileLink: blankToNull(fileLink),
+                department: blankToNull(department),
+                jobTitle: blankToNull(jobTitle),
+                authorityRank,
+                authoritySource: blankToNull(authoritySource),
+                modifiedDate: blankToNull(modifiedDate)
+            };
+            const searchDocuments = chunks.map((chunk, idx) => buildSearchDocument({
+                chunk,
+                contentVector: embeddings[idx],
+                metadata: searchMetadata
             }));
 
             await uploadChunks(searchDocuments);
-            log(`Step 9 Output (Azure AI Search): Uploaded ${searchDocuments.length} hybrid vector chunk(s) to index "${searchIndex}".`);
+            const deleted = await deleteReplacedChunks(
+                searchMetadata.documentKey,
+                searchDocuments.map(document => document.id)
+            );
+            log(`Step 9 Output (Azure AI Search): Uploaded ${searchDocuments.length} hybrid vector chunk(s) to index "${searchIndex}". Deleted replaced chunks: ${deleted}.`);
         } else {
             log('Step 8 & 9 Output: Skipped search indexing (0 chunks).');
         }

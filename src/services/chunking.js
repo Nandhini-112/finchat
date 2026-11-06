@@ -1,16 +1,36 @@
+const { buildChunkId } = require('./search-document');
+
 const DEFAULT_CHUNK_SIZE = 1000;
 const DEFAULT_CHUNK_OVERLAP = 200;
 
-function createChunks(normalizedDoc, fileName, chunkSize = null, chunkOverlap = null) {
+function pageNumberFromText(text) {
+    const matches = [...String(text || '').matchAll(/<!--\s*Page\s+(\d+)\s*-->/gi)];
+    if (matches.length === 0) return null;
+    const page = Number(matches[matches.length - 1][1]);
+    return Number.isInteger(page) && page > 0 ? page : null;
+}
+
+function createChunks(normalizedDoc, fileName, chunkSize = null, chunkOverlap = null, options = null) {
     const size = chunkSize || Number(process.env.CHUNK_SIZE) || DEFAULT_CHUNK_SIZE;
     const overlap = chunkOverlap || Number(process.env.CHUNK_OVERLAP) || DEFAULT_CHUNK_OVERLAP;
 
     const documentId = normalizedDoc.document_id;
+    const queueKey = options && options.queueKey;
     const rawContent = normalizedDoc.fullMarkdown || '';
     const tables = normalizedDoc.tables || [];
 
     const chunks = [];
-    let chunkIndex = 0;
+
+    const pushChunk = (fields) => {
+        const chunkIndex = chunks.length;
+        chunks.push({
+            ...fields,
+            id: buildChunkId({ queueKey, documentId, chunkIndex }),
+            chunkIndex,
+            documentId,
+            source: fileName
+        });
+    };
 
     const sections = rawContent.split(/(?=\n#{1,3}\s+)/);
 
@@ -19,15 +39,14 @@ function createChunks(normalizedDoc, fileName, chunkSize = null, chunkOverlap = 
         if (!trimmed) continue;
 
         const headingMatch = trimmed.match(/^#{1,3}\s+(.+)$/m);
-        const sectionTitle = headingMatch ? headingMatch[1].trim() : `Section ${chunkIndex + 1}`;
+        const sectionTitle = headingMatch ? headingMatch[1].trim() : `Section ${chunks.length + 1}`;
 
         if (trimmed.length <= size) {
-            chunks.push({
-                id: `doc_${documentId}_chunk_${chunkIndex++}`,
+            pushChunk({
                 title: `${fileName} - ${sectionTitle}`,
                 content: trimmed,
-                source: fileName,
-                documentId,
+                heading: sectionTitle,
+                pageNumber: pageNumberFromText(trimmed),
                 sectionTitle
             });
         } else {
@@ -42,12 +61,11 @@ function createChunks(normalizedDoc, fileName, chunkSize = null, chunkOverlap = 
 
                 const piece = trimmed.substring(start, end).trim();
                 if (piece) {
-                    chunks.push({
-                        id: `doc_${documentId}_chunk_${chunkIndex++}`,
+                    pushChunk({
                         title: `${fileName} - ${sectionTitle} (Part ${subIndex + 1})`,
                         content: piece,
-                        source: fileName,
-                        documentId,
+                        heading: sectionTitle,
+                        pageNumber: pageNumberFromText(trimmed.slice(0, end)),
                         sectionTitle
                     });
                     subIndex++;
@@ -61,14 +79,13 @@ function createChunks(normalizedDoc, fileName, chunkSize = null, chunkOverlap = 
 
     for (const table of tables) {
         if (table.content && table.content.length > 50) {
-            chunks.push({
-                id: `doc_${documentId}_chunk_${chunkIndex++}`,
-                title: `${fileName} - Table ${table.table_id} (Page ${table.page_number})`,
+            const heading = `Table ${table.table_id}`;
+            pushChunk({
+                title: `${fileName} - ${heading} (Page ${table.page_number})`,
                 content: table.content,
-                source: fileName,
-                documentId,
+                heading,
                 pageNumber: table.page_number,
-                sectionTitle: `Table ${table.table_id}`
+                sectionTitle: heading
             });
         }
     }
