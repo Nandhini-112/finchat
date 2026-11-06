@@ -4,14 +4,12 @@ const { AppError } = require('../utils/errors');
 const { ensureSearchIndexFields } = require('./search-index');
 const {
     RETRIEVABLE_EXTENDED_FIELDS,
-    toLegacySearchDocument,
     escapeODataString
 } = require('./search-document');
 
 let searchClient = null;
-let legacyUploadWarningLogged = false;
 
-const LEGACY_SELECT = ['id', 'title', 'content', 'source'];
+const SELECT_FIELDS = ['id', 'title', 'content', 'source', ...RETRIEVABLE_EXTENDED_FIELDS];
 
 function getSearchClient() {
     if (!searchClient) {
@@ -30,15 +28,8 @@ function getSearchClient() {
 
 async function uploadChunks(documents) {
     if (!documents || documents.length === 0) return [];
-    const schema = await ensureSearchIndexFields();
-    const payload = schema.ready ? documents : documents.map(toLegacySearchDocument);
-
-    if (!schema.ready && !legacyUploadWarningLogged) {
-        legacyUploadWarningLogged = true;
-        console.warn(`[AzureSearch] ${schema.reason} Uploading id, title, content, source, and contentVector only.`);
-    }
-
-    return uploadDocuments(payload);
+    await ensureSearchIndexFields();
+    return uploadDocuments(documents);
 }
 
 async function uploadDocuments(documents) {
@@ -65,9 +56,6 @@ async function uploadDocuments(documents) {
  */
 async function deleteReplacedChunks(documentKey, retainedIds) {
     if (!documentKey) return 0;
-
-    const schema = await ensureSearchIndexFields();
-    if (!schema.ready) return 0;
 
     const client = getSearchClient();
     const retained = new Set(retainedIds || []);
@@ -117,19 +105,17 @@ async function searchSimilar(queryVector, options = {}) {
     const searchText = (options.searchText || options.queryText || '*').trim();
 
     try {
-        const schema = await ensureSearchIndexFields();
-        const select = schema.ready ? [...LEGACY_SELECT, ...RETRIEVABLE_EXTENDED_FIELDS] : LEGACY_SELECT;
         const searchResults = await client.search(searchText, {
             vectors: [
                 {
                     value: queryVector,
                     kNearestNeighborsCount: top,
-                    fields: ['contentVector'] // what is contentVector
+                    fields: ['contentVector']
                 }
             ],
             filter,
             top,
-            select
+            select: SELECT_FIELDS
         });
 
         const documents = [];
