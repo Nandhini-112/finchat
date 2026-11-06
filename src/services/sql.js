@@ -54,7 +54,16 @@ async function ensureDatabaseSchema(p) {
                     AllowedUserGroups NVARCHAR(1000) NULL,
                     IngestionStatus NVARCHAR(30) NOT NULL DEFAULT 'Processing',
                     LastProcessedAt DATETIME2 NULL,
-                    CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+                    CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+                    CreatedByUserId NVARCHAR(255) NULL,
+                    CreatedByName NVARCHAR(150) NULL,
+                    CreatedByEmail NVARCHAR(255) NULL,
+                    CreatedByDepartment NVARCHAR(100) NULL,
+                    ModifiedByUserId NVARCHAR(255) NULL,
+                    ModifiedByName NVARCHAR(150) NULL,
+                    ModifiedByEmail NVARCHAR(255) NULL,
+                    ModifiedAt DATETIME2 NULL,
+                    ProcessingError NVARCHAR(MAX) NULL
                 );
             END;
 
@@ -96,6 +105,25 @@ async function ensureDatabaseSchema(p) {
                     ReviewedAt DATETIME2 NULL,
                     CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
                 );
+            END;
+
+            --6. Authority rank Table
+            -- AuthorityRank Table
+                IF NOT EXISTS (
+                     SELECT *FROM sys.tables WHERE name = 'AuthorityRank')
+                BEGIN
+                    CREATE TABLE dbo.AuthorityRank (
+                    Id INT IDENTITY(1,1) PRIMARY KEY,
+                    CreatedByName NVARCHAR(150) NULL,
+                    CreatedByEmail NVARCHAR(255) NULL,
+                    CreatedByUserId NVARCHAR(255) NULL,
+                    JobTitle NVARCHAR(150) NOT NULL,
+                    Department NVARCHAR(100) NOT NULL,
+                    AuthorityRank INT NOT NULL,
+                    AuthorityLevel NVARCHAR(50) NULL,
+                    IsActive BIT NOT NULL DEFAULT 1,
+                    CreatedAt DATETIME2 NULL DEFAULT SYSUTCDATETIME()
+               );
             END;
         `);
         schemaInitialized = true;
@@ -177,6 +205,26 @@ async function completeIngestionRun(runId, filesSucceeded, filesFailed, runStatu
                 FilesFailed = @FilesFailed,
                 RunStatus = @RunStatus,
                 ErrorSummary = @ErrorSummary
+            WHERE RunId = @RunId
+        `);
+}
+
+async function updateIngestionRunProgress(runId, isSuccess = true, errorSummary = null) {
+    if (!runId) return;
+    const p = await getPool();
+    await p.request()
+        .input('RunId', sql.BigInt, runId)
+        .input('IsSuccess', sql.Bit, isSuccess ? 1 : 0)
+        .input('ErrorSummary', sql.NVarChar(sql.MAX), errorSummary)
+        .query(`
+            UPDATE dbo.IngestionRuns
+            SET FilesSucceeded = FilesSucceeded + CASE WHEN @IsSuccess = 1 THEN 1 ELSE 0 END,
+                FilesFailed = FilesFailed + CASE WHEN @IsSuccess = 0 THEN 1 ELSE 0 END,
+                ErrorSummary = CASE 
+                    WHEN @ErrorSummary IS NOT NULL AND ErrorSummary IS NULL THEN @ErrorSummary
+                    WHEN @ErrorSummary IS NOT NULL THEN SUBSTRING(ErrorSummary + CHAR(10) + @ErrorSummary, 1, 4000)
+                    ELSE ErrorSummary
+                END
             WHERE RunId = @RunId
         `);
 }
@@ -331,6 +379,7 @@ module.exports = {
     getPool,
     startIngestionRun,
     completeIngestionRun,
+    updateIngestionRunProgress,
     createDocument,
     updateDocumentStatus,
     insertFinancialFacts,

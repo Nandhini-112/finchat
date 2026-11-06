@@ -679,9 +679,9 @@ async function getPendingQueueItems(
                 Title: getField(fields, 'Title'),
 
                 FileName: (() => {
-                    const rawFn = getField(fields, 'FileName') || 
-                                  getField(fields, 'FileLeafRef') || 
-                                  getField(fields, 'Title') || '';
+                    const rawFn = getField(fields, 'FileName') ||
+                        getField(fields, 'FileLeafRef') ||
+                        getField(fields, 'Title') || '';
                     try {
                         return decodeURIComponent(rawFn);
                     } catch (_) {
@@ -806,7 +806,7 @@ async function downloadDriveItemBuffer(
 }
 
 /**
- * Update SharePoint queue item status (e.g. 'In Progress', 'Processed', 'Failed')
+ * Update SharePoint queue item status (e.g. 'Processing', 'Processed', 'Failed','Pending')
  * and records truncated ErrorSummary on failure.
  */
 async function updateQueueItemStatus(
@@ -832,7 +832,7 @@ async function updateQueueItemStatus(
 
         if (status === 'Failed' || errorSummary) {
             patchPayload.ErrorSummary = errorSummary ? String(errorSummary).slice(0, 500) : '';
-        } else if (status === 'Processed' || status === 'In Progress') {
+        } else if (status === 'Processed' || status === 'Processing' ||) {
             patchPayload.ErrorSummary = '';
         }
 
