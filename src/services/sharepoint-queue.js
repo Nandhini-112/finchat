@@ -699,6 +699,18 @@ async function getPendingQueueItems(
 
                 FileVersion: getField(fields, 'FileVersion'),
 
+                DocumentKey: getField(fields, 'DocumentKey'),
+
+                QueueKey: getField(fields, 'QueueKey'),
+
+                FileLink: getField(fields, 'FileLinkText') || getField(fields, 'FileLink'),
+
+                ModifiedDate: getField(fields, 'ModifiedDate'),
+
+                CreatedByDepartment: getField(fields, 'CreatedByDepartment'),
+
+                CreatedByJobTitle: getField(fields, 'CreatedByJobTitle'),
+
                 ProcessingStatus: getField(
                     fields,
                     'ProcessingStatus'
