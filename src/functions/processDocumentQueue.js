@@ -6,6 +6,7 @@ const {
     updateQueueItemStatus
 } = require('../services/sharepoint-queue');
 const { processDocumentIngestion } = require('../services/ingestion-pipeline');
+const { resolveDocumentKey, resolveQueueKey, blankToNull } = require('../services/search-document');
 
 // Dynamically bind schedule to environment variable %DOCUMENT_QUEUE_CRON% with fallback to monthly schedule
 const timerSchedule = process.env.DOCUMENT_QUEUE_CRON ? process.env.DOCUMENT_QUEUE_CRON : '%DOCUMENT_QUEUE_CRON%';
@@ -80,7 +81,13 @@ app.timer('processDocumentQueue', {
                         authorityRank,
                         allowedUserGroups: record.AllowedUserGroups || null,
                         correlationId: itemCorrelationId,
-                        context
+                        context,
+                        documentKey: resolveDocumentKey(record),
+                        queueKey: resolveQueueKey(record),
+                        fileLink: blankToNull(record.FileLink),
+                        department: blankToNull(record.CreatedByDepartment),
+                        jobTitle: blankToNull(record.CreatedByJobTitle),
+                        modifiedDate: blankToNull(record.ModifiedDate)
                     });
 
                     // Step C: Update SharePoint Queue List Item status to 'Processed'

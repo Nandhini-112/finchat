@@ -57,17 +57,25 @@ function formatSourceReferences(retrievedChunks) {
     if (!retrievedChunks || retrievedChunks.length === 0) return [];
 
     return retrievedChunks.map(chunk => {
-        let pageNumber = 1;
-        const pageMatch = (chunk.title || '').match(/Page\s+(\d+)/i) || (chunk.content || '').match(/Page\s+(\d+)/i);
-        if (pageMatch) {
-            pageNumber = parseInt(pageMatch[1], 10);
+        let pageNumber = Number(chunk.pageNumber);
+        if (!Number.isInteger(pageNumber) || pageNumber < 1) {
+            pageNumber = 1;
+            const pageMatch = (chunk.title || '').match(/Page\s+(\d+)/i) || (chunk.content || '').match(/Page\s+(\d+)/i);
+            if (pageMatch) pageNumber = parseInt(pageMatch[1], 10);
         }
 
         return {
-            source: chunk.source || 'Unknown',
+            source: chunk.fileName || chunk.source || 'Unknown',
+            fileLink: chunk.fileLink || null,
             chunkId: chunk.id,
-            title: chunk.title || 'Section',
-            pageNumber
+            title: chunk.title || chunk.heading || 'Section',
+            pageNumber,
+            department: chunk.department || null,
+            jobTitle: chunk.jobTitle || null,
+            authorityRank: chunk.authorityRank ?? null,
+            authoritySource: chunk.authoritySource || null,
+            documentKey: chunk.documentKey || null,
+            queueKey: chunk.queueKey || null
         };
     });
 }
