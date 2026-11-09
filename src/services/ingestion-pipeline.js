@@ -136,7 +136,7 @@ async function processDocumentIngestion({
             log('Step 6 Output: Skipped SQL fact insertion (0 facts extracted).');
         }
 
-        // STEP 7: RETRIEVAL CHUNKING
+        /// STEP 7: RETRIEVAL CHUNKING
         currentStep = 'STEP 7: RETRIEVAL CHUNKING';
         log(`=== ${currentStep} ===`);
 

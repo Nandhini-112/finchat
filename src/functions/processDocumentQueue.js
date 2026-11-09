@@ -13,7 +13,7 @@ const {
     completeIngestionRun
 } = require('../services/sql');
 
-// Dynamically bind schedule to environment variable %DOCUMENT_QUEUE_CRON% with fallback to monthly schedule
+/// Dynamically bind schedule to environment variable %DOCUMENT_QUEUE_CRON% with fallback to monthly schedule
 const timerSchedule = process.env.DOCUMENT_QUEUE_CRON ? process.env.DOCUMENT_QUEUE_CRON : '%DOCUMENT_QUEUE_CRON%';
 const CONCURRENCY_LIMIT = 3;
 

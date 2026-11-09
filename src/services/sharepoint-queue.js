@@ -896,7 +896,7 @@ async function readPendingQueueItems(context) {
             context?.log?.(`Associated Document Library drive resolved: ${listDriveId}`);
         }
     } catch (_) {
-        // Normal for custom generic lists
+        /// Normal for custom generic lists
     }
 
     // Step 3: Retrieve Pending items.

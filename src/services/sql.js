@@ -128,7 +128,7 @@ async function ensureDatabaseSchema(p) {
         `);
         schemaInitialized = true;
     } catch (err) {
-        // Log warning if schema check cannot run yet (e.g. read-only user or initial probe)
+        /// Log warning if schema check cannot run yet (e.g. read-only user or initial probe)
         console.warn('Notice: Automatic database schema initialization encountered an issue:', err.message);
     }
 }
