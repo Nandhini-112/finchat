@@ -832,7 +832,7 @@ async function updateQueueItemStatus(
 
         if (status === 'Failed' || errorSummary) {
             patchPayload.ErrorSummary = errorSummary ? String(errorSummary).slice(0, 500) : '';
-        } else if (status === 'Processed' || status === 'Processing' ||) {
+        } else if (status === 'Processed' || status === 'Processing' || status === 'In Progress') {
             patchPayload.ErrorSummary = '';
         }
 
