@@ -14,6 +14,7 @@
     "@azure/identity": "^4.14.1",
     "@azure/search-documents": "^13.0.0",
     "@microsoft/microsoft-graph-client": "^3.0.7",
+    "botbuilder": "^4.23.3",
     "dotenv": "^18.0.9",
     "mssql": "^12.7.13",
     "openai": "^7.45.1",
