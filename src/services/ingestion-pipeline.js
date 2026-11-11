@@ -46,14 +46,18 @@ async function processDocumentIngestion({
     department = null,
     jobTitle = null,
     modifiedDate = null,
-    authoritySource = null
+    authoritySource = null,
+    existingRunId = null,
+    manageRun = null,
+    existingDocumentId = null
 }) {
     const corrId = correlationId || `ingest-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
     const log = (msg) => (context.log ? context.log(`[${corrId}] ${msg}`) : console.log(`[${corrId}] ${msg}`));
     const errorLog = (msg) => (context.error ? context.error(`[${corrId}] ${msg}`) : console.error(`[${corrId}] ${msg}`));
 
+    const shouldManageRun = manageRun !== null ? Boolean(manageRun) : (existingRunId === null);
     let currentStep = 'INITIALIZATION';
-    let runId = null;
+    let runId = existingRunId || null;
     let documentId = null;
 
     try {
@@ -61,7 +65,7 @@ async function processDocumentIngestion({
         currentStep = 'STEP 1: VALIDATION & SCOPE ENFORCEMENT';
         log(`=== ${currentStep} ===`);
 
-        validateDocumentBuffer(fileBuffer, fileName);
+        await validateDocumentBuffer(fileBuffer, fileName);
 
         log(`Step 1 Output: File "${fileName}" validated successfully (${(fileBuffer.length / 1024).toFixed(1)} KB, Rank ${authorityRank}).`);
 
@@ -69,10 +73,16 @@ async function processDocumentIngestion({
         currentStep = 'STEP 2: INGESTION LIFECYCLE REGISTRATION (AZURE SQL)';
         log(`=== ${currentStep} ===`);
 
-        runId = await startIngestionRun(1);
-        documentId = await createDocument(fileName, sourceType, authorityRank, allowedUserGroups);
+        if (shouldManageRun && !runId) {
+            runId = await startIngestionRun(1);
+        }
+        if (existingDocumentId) {
+            documentId = existingDocumentId;
+        } else {
+            documentId = await createDocument(fileName, sourceType, authorityRank, allowedUserGroups);
+        }
 
-        log(`Step 2 Output: dbo.IngestionRuns ID=${runId}, dbo.Documents ID=${documentId} (Status: Processing).`);
+        log(`Step 2 Output: dbo.IngestionRuns ID=${runId || 'N/A'}, dbo.Documents ID=${documentId} (Status: Processing).`);
 
         // STEP 3: DOCUMENT EXTRACTION (PDF / EXCEL EXTRACTOR)
         currentStep = 'STEP 3: DOCUMENT EXTRACTION (PDF / EXCEL)';
@@ -131,7 +141,7 @@ async function processDocumentIngestion({
             log('Step 6 Output: Skipped SQL fact insertion (0 facts extracted).');
         }
 
-        // STEP 7: RETRIEVAL CHUNKING
+        /// STEP 7: RETRIEVAL CHUNKING
         currentStep = 'STEP 7: RETRIEVAL CHUNKING';
         log(`=== ${currentStep} ===`);
 
@@ -191,9 +201,12 @@ async function processDocumentIngestion({
         log(`=== ${currentStep} ===`);
 
         await updateDocumentStatus(documentId, 'Succeeded');
-        await completeIngestionRun(runId, 1, 0, 'Succeeded');
-
-        log(`Step 10 Output: Ingestion finalized as Succeeded for DocumentId=${documentId}, RunId=${runId}.`);
+        if (shouldManageRun && runId) {
+            await completeIngestionRun(runId, 1, 0, 'Succeeded');
+            log(`Step 10 Output: Ingestion finalized as Succeeded for DocumentId=${documentId}, RunId=${runId}.`);
+        } else {
+            log(`Step 10 Output: Ingestion finalized as Succeeded for DocumentId=${documentId} (Batch RunId=${runId || 'N/A'}).`);
+        }
         log(`>>> INGESTION FINISHED SUCCESSFULLY <<< DocumentId=${documentId}, Facts=${extractedFacts.length}, Chunks=${chunks.length}`);
 
         return {
@@ -226,7 +239,7 @@ async function processDocumentIngestion({
             });
         }
 
-        if (runId) {
+        if (shouldManageRun && runId) {
             await completeIngestionRun(runId, 0, 1, 'Failed', sanitizeErrorMessage(err)).catch(e => {
                 errorLog(`Failed to update ingestion run to Failed: ${e.message}`);
             });
