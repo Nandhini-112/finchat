@@ -1,28 +1,6 @@
 require('../utils/config');
-const OpenAI = require('openai').default;
+const { chatCompletion } = require('./model-client');
 const { AppError } = require('../utils/errors');
-
-let llmClient = null;
-
-function getLLMClient() {
-    if (!llmClient) {
-        // Supports Groq or Azure OpenAI or OpenAI
-        const apiKey = process.env.GROQ_API_KEY || process.env.AZURE_OPENAI_API_KEY;
-        const baseURL = process.env.GROQ_BASE_URL || (process.env.AZURE_OPENAI_ENDPOINT ? `${process.env.AZURE_OPENAI_ENDPOINT.replace(/\/+$/, '')}/openai/v1` : undefined);
-
-        if (!apiKey) {
-            throw new AppError('LLM API key (GROQ_API_KEY or AZURE_OPENAI_API_KEY) is not configured.', 500);
-        }
-
-        llmClient = new OpenAI({
-            apiKey,
-            baseURL,
-            maxRetries: Number(process.env.GROQ_MAX_RETRIES || 3),
-            timeout: Number(process.env.GROQ_TIMEOUT_SECONDS || 60) * 1000
-        });
-    }
-    return llmClient;
-}
 
 const SYSTEM_PROMPT = `You are Finora AI, an enterprise financial and HR document intelligence assistant.
 Your answers must be grounded STRICTLY and ONLY in the provided evidence (verified database facts, deterministic calculations, conflict registers, and retrieved document excerpts).
@@ -40,18 +18,22 @@ CRITICAL OPERATIONAL RULES:
 8. Always cite the relevant document source name, page number, or table.
 9. Keep answers professional, precise, and structured.`;
 
-async function generateAnswer(question, chunks = [], facts = [], calculations = []) {
-    const client = getLLMClient();
-    const model = process.env.GROQ_MODEL || process.env.AZURE_OPENAI_CHAT_DEPLOYMENT || (process.env.GROQ_API_KEY ? 'llama-3.3-70b-versatile' : 'gpt-4o-mini');
+/**
+ * Generates an evidence-grounded answer using the active LLM.
+ * Formats math calculations, conflict notes, SQL facts, and document excerpts into the prompt.
+ */
+async function generateAnswer(question, chunks = [], facts = [], calculations = [], options = {}) {
+    const jobId = typeof options === 'string' ? options : (options?.jobId || options?.correlationId || null);
 
     if ((!chunks || chunks.length === 0) && (!facts || facts.length === 0) && (!calculations || calculations.length === 0)) {
         return {
             answer: 'I could not find any relevant information or documents matching your question.',
-            insufficientEvidence: true
+            insufficientEvidence: true,
+            jobId
         };
     }
 
-    // 1. Calculations Context
+    // Section 1: Deterministic math calculations (variances, period comparisons, sums)
     let calculationsContext = '';
     if (calculations && calculations.length > 0) {
         calculationsContext = 'DETERMINISTIC MATHEMATICAL CALCULATIONS (Pre-calculated in code; adopt as unalterable truth):\n' +
@@ -74,7 +56,7 @@ async function generateAnswer(question, chunks = [], facts = [], calculations = 
             '\n\n';
     }
 
-    // 2. Conflict Context
+    // Section 2: Data governance and document conflict notes
     const conflictedFacts = facts.filter(f => f.hasConflict);
     let conflictContext = '';
     if (conflictedFacts.length > 0) {
@@ -83,7 +65,7 @@ async function generateAnswer(question, chunks = [], facts = [], calculations = 
             '\n\n';
     }
 
-    // 3. Facts Context
+    // Section 3: Verified facts retrieved from SQL database
     let factsContext = '';
     if (facts.length > 0) {
         factsContext = 'VERIFIED STRUCTURED FACTS (From Database):\n' +
@@ -95,7 +77,7 @@ async function generateAnswer(question, chunks = [], facts = [], calculations = 
             '\n\n';
     }
 
-    // 4. Chunks Context
+    // Section 4: Document chunks retrieved from Azure AI Search
     let chunksContext = '';
     if (chunks.length > 0) {
         chunksContext = 'RETRIEVED DOCUMENT EXCERPTS:\n' +
@@ -105,23 +87,30 @@ async function generateAnswer(question, chunks = [], facts = [], calculations = 
     const fullEvidence = (calculationsContext + conflictContext + factsContext + chunksContext).trim();
 
     try {
-        const response = await client.chat.completions.create({
-            model,
+        const maxTokens = Number(process.env.LLM_MAX_TOKENS || process.env.GROQ_MAX_TOKENS || 4096);
+        const temperature = Number(process.env.LLM_TEMPERATURE || process.env.GROQ_TEMPERATURE || 0.1);
+
+        const response = await chatCompletion({
             messages: [
                 { role: 'system', content: SYSTEM_PROMPT },
                 { role: 'user', content: `User Question:\n${question}\n\nEvidence:\n${fullEvidence}\n\nPlease provide your grounded answer:` }
             ],
-            max_tokens: Number(process.env.GROQ_MAX_TOKENS || 4096),
-            temperature: Number(process.env.GROQ_TEMPERATURE || 0.1)
+            maxTokens,
+            temperature,
+            jobId
         });
 
-        const answerText = response.choices?.[0]?.message?.content || '';
+        const answerText = response.text || '';
         const insufficientPattern = /do not contain|not provided|not mentioned|insufficient information|no relevant information|cannot be found/i;
         const insufficientEvidence = insufficientPattern.test(answerText);
 
         return {
             answer: answerText,
-            insufficientEvidence
+            insufficientEvidence,
+            provider: response.provider,
+            model: response.model,
+            jobId,
+            usage: response.usage || { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
         };
     } catch (err) {
         if (err instanceof AppError) throw err;
