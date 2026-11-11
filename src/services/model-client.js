@@ -1,5 +1,5 @@
 require('../utils/config');
-const OpenAI = require('openai').default;
+const { OpenAI, AzureOpenAI } = require('openai');
 const { AppError } = require('../utils/errors');
 
 let llmClient = null;
@@ -8,8 +8,8 @@ let activeProvider = '';
 
 /**
  * Selects which LLM client to use:
- * 1. Checks .env for Azure OpenAI (primary production model).
- * 2. If Azure is not configured, falls back to Groq.
+ * 1. Checks .env for Azure OpenAI (primary production model using official AzureOpenAI client).
+ * 2. If Azure is not configured, falls back to Groq (using standard OpenAI client).
  * 
  * Note: If Groq is removed in the future, only this function needs updating.
  */
@@ -26,16 +26,20 @@ function getClient() {
     );
 
     if (hasAzure) {
-        const endpoint = process.env.AZURE_OPENAI_ENDPOINT.trim().replace(/\/+$/, '');
-        const baseURL = endpoint.endsWith('/openai/v1') ? endpoint : `${endpoint}/openai/v1`;
+        const rawEndpoint = process.env.AZURE_OPENAI_ENDPOINT.trim().replace(/\/+$/, '');
+        const cleanEndpoint = rawEndpoint.replace(/\/openai(\/v1)?$/, '');
+        const apiVersion = (process.env.AZURE_OPENAI_API_VERSION || process.env.OPENAI_API_VERSION || '2024-06-01').trim();
+        const deployment = process.env.AZURE_OPENAI_CHAT_DEPLOYMENT.trim();
 
-        llmClient = new OpenAI({
+        llmClient = new AzureOpenAI({
+            endpoint: cleanEndpoint,
             apiKey: process.env.AZURE_OPENAI_API_KEY.trim(),
-            baseURL,
+            apiVersion,
+            deployment,
             maxRetries: 2,
             timeout: Number(process.env.AZURE_OPENAI_TIMEOUT_SECONDS || 30) * 1000
         });
-        activeModel = process.env.AZURE_OPENAI_CHAT_DEPLOYMENT.trim();
+        activeModel = deployment;
         activeProvider = 'azure';
         return { client: llmClient, model: activeModel, provider: activeProvider };
     }

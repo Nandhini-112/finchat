@@ -1,18 +1,18 @@
 require('../utils/config');
-const OpenAI = require('openai').default;
+const { AzureOpenAI } = require('openai');
 const { AppError } = require('../utils/errors');
 
 let embeddingClient = null;
 
 /**
- * Creates the Azure OpenAI client for embeddings.
+ * Creates the official Azure OpenAI client for embeddings.
  * Note: Uses Azure OpenAI exclusively to preserve consistent 1536-dim vectors in AI Search.
  */
 function getEmbeddingClient() {
     if (!embeddingClient) {
-        const endpoint = (process.env.AZURE_EMBEDDING_ENDPOINT || process.env.AZURE_OPENAI_ENDPOINT || '').trim();
-        const apiKey = (process.env.AZURE_EMBEDDING_API_KEY || process.env.AZURE_OPENAI_API_KEY || '').trim();
-        const deployment = (process.env.AZURE_EMBEDDING_DEPLOYMENT || process.env.AZURE_OPENAI_EMBEDDING_DEPLOYMENT || '').trim();
+        const endpoint = (process.env.AZURE_EMBEDDING_ENDPOINT || '').trim();
+        const apiKey = (process.env.AZURE_EMBEDDING_API_KEY || '').trim();
+        const deployment = (process.env.AZURE_EMBEDDING_DEPLOYMENT || '').trim();
 
         if (!endpoint || !apiKey || !deployment) {
             throw new AppError(
@@ -21,12 +21,15 @@ function getEmbeddingClient() {
             );
         }
 
-        const cleanEndpoint = endpoint.replace(/\/+$/, '');
-        const baseURL = cleanEndpoint.endsWith('/openai/v1') ? cleanEndpoint : `${cleanEndpoint}/openai/v1`;
+        const rawEndpoint = endpoint.replace(/\/+$/, '');
+        const cleanEndpoint = rawEndpoint.replace(/\/openai(\/v1)?$/, '');
+        const apiVersion = (process.env.AZURE_EMBEDDING_API_VERSION || process.env.AZURE_OPENAI_API_VERSION || '2024-06-01').trim();
 
-        embeddingClient = new OpenAI({
+        embeddingClient = new AzureOpenAI({
+            endpoint: cleanEndpoint,
             apiKey,
-            baseURL,
+            apiVersion,
+            deployment,
             maxRetries: 3,
             timeout: Number(process.env.AZURE_EMBEDDING_TIMEOUT_SECONDS || 30) * 1000
         });
@@ -46,7 +49,7 @@ async function generateBatchEmbeddings(texts, batchSize = 10, options = {}) {
     const jobTag = jobId ? `[Job: ${jobId}] ` : '';
 
     const client = getEmbeddingClient();
-    const model = (process.env.AZURE_EMBEDDING_DEPLOYMENT || process.env.AZURE_OPENAI_EMBEDDING_DEPLOYMENT || '').trim();
+    const model = (process.env.AZURE_EMBEDDING_DEPLOYMENT || '').trim();
     const allVectors = [];
 
     for (let i = 0; i < texts.length; i += batchSize) {

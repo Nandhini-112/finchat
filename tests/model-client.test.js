@@ -1,5 +1,6 @@
 const { test, describe, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
+const { OpenAI, AzureOpenAI } = require('openai');
 const {
     getClient,
     getActiveModelInfo,
@@ -8,6 +9,7 @@ const {
 } = require('../src/services/model-client');
 const {
     generateBatchEmbeddings,
+    getEmbeddingClient,
     resetEmbeddingClient
 } = require('../src/services/embeddings');
 
@@ -33,6 +35,7 @@ describe('Unified LLM Client (Azure Priority, Groq Fallback)', () => {
         assert.equal(target.provider, 'azure');
         assert.equal(target.model, 'gpt-4o');
         assert.ok(target.client);
+        assert.ok(target.client instanceof AzureOpenAI);
     });
 
     test('getClient() seamlessly takes Groq when Azure is not in env', () => {
@@ -48,6 +51,8 @@ describe('Unified LLM Client (Azure Priority, Groq Fallback)', () => {
         assert.equal(target.provider, 'groq');
         assert.equal(target.model, 'qwen/qwen3.8-27b');
         assert.ok(target.client);
+        assert.ok(target.client instanceof OpenAI);
+        assert.ok(!(target.client instanceof AzureOpenAI));
     });
 
     test('getClient() throws error when neither Azure nor Groq is configured in env', () => {
@@ -151,11 +156,8 @@ describe('Single Embedding Model', () => {
 
     test('generateBatchEmbeddings throws when Azure embedding configuration is missing from env', async () => {
         delete process.env.AZURE_EMBEDDING_ENDPOINT;
-        delete process.env.AZURE_OPENAI_ENDPOINT;
         delete process.env.AZURE_EMBEDDING_API_KEY;
-        delete process.env.AZURE_OPENAI_API_KEY;
         delete process.env.AZURE_EMBEDDING_DEPLOYMENT;
-        delete process.env.AZURE_OPENAI_EMBEDDING_DEPLOYMENT;
 
         await assert.rejects(
             async () => {
@@ -166,5 +168,15 @@ describe('Single Embedding Model', () => {
                 message: /Azure embedding model is not configured/
             }
         );
+    });
+
+    test('getEmbeddingClient() creates an official AzureOpenAI instance', () => {
+        process.env.AZURE_EMBEDDING_ENDPOINT = 'https://my-resource.services.ai.azure.com';
+        process.env.AZURE_EMBEDDING_API_KEY = 'test-key';
+        process.env.AZURE_EMBEDDING_DEPLOYMENT = 'text-embedding-3-small';
+
+        const client = getEmbeddingClient();
+        assert.ok(client);
+        assert.ok(client instanceof AzureOpenAI);
     });
 });
