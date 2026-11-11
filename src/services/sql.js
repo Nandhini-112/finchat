@@ -107,7 +107,7 @@ async function ensureDatabaseSchema(p) {
                 );
             END;
 
-            -- 6. AuthorityRank Table (Employee Authority Ranks)
+            -- 6. AuthorityRank Table
             IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'AuthorityRank')
             BEGIN
                 CREATE TABLE dbo.AuthorityRank (
@@ -116,104 +116,18 @@ async function ensureDatabaseSchema(p) {
                     CreatedByEmail NVARCHAR(255) NULL,
                     CreatedByUserId NVARCHAR(255) NULL,
                     JobTitle NVARCHAR(150) NOT NULL,
-                    NormalizedJobTitle NVARCHAR(150) NULL,
                     Department NVARCHAR(100) NOT NULL,
-                    NormalizedDepartment NVARCHAR(100) NULL,
                     AuthorityRank INT NOT NULL,
                     AuthorityLevel NVARCHAR(50) NULL,
                     IsActive BIT NOT NULL DEFAULT 1,
-                    CreatedAt DATETIME2 NULL DEFAULT SYSUTCDATETIME(),
-                    UpdatedAt DATETIME2 NULL
+                    CreatedAt DATETIME2 NULL DEFAULT SYSUTCDATETIME()
                 );
-            END
-            ELSE
-            BEGIN
-                -- Idempotent schema migration for existing AuthorityRank table
-                IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.AuthorityRank') AND name = 'NormalizedJobTitle')
-                BEGIN
-                    ALTER TABLE dbo.AuthorityRank ADD NormalizedJobTitle NVARCHAR(150) NULL;
-                END;
-
-                IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.AuthorityRank') AND name = 'NormalizedDepartment')
-                BEGIN
-                    ALTER TABLE dbo.AuthorityRank ADD NormalizedDepartment NVARCHAR(100) NULL;
-                END;
-
-                IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.AuthorityRank') AND name = 'UpdatedAt')
-                BEGIN
-                    ALTER TABLE dbo.AuthorityRank ADD UpdatedAt DATETIME2 NULL;
-                END;
-            END;
-
-            -- Populate normalized fields for existing records
-            UPDATE dbo.AuthorityRank
-            SET NormalizedJobTitle = LOWER(LTRIM(RTRIM(JobTitle))),
-                NormalizedDepartment = LOWER(LTRIM(RTRIM(Department)))
-            WHERE NormalizedJobTitle IS NULL OR NormalizedDepartment IS NULL;
-
-            -- Safe unique index: only create if no duplicate normalized pairs exist
-            IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_AuthorityRank_JobTitle_Department' AND object_id = OBJECT_ID('dbo.AuthorityRank'))
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT NormalizedJobTitle, NormalizedDepartment, COUNT(*)
-                    FROM dbo.AuthorityRank
-                    WHERE NormalizedJobTitle IS NOT NULL AND NormalizedDepartment IS NOT NULL
-                    GROUP BY NormalizedJobTitle, NormalizedDepartment
-                    HAVING COUNT(*) > 1
-                )
-                BEGIN
-                    CREATE UNIQUE INDEX UX_AuthorityRank_JobTitle_Department
-                    ON dbo.AuthorityRank(NormalizedJobTitle, NormalizedDepartment);
-                END
-            END;
-
-            -- Seed initial sample authority rankings if table is empty
-            -- NOTE: Sample seed data for testing purposes only. Replace with HR/management-approved mappings.
-            IF NOT EXISTS (SELECT 1 FROM dbo.AuthorityRank)
-            BEGIN
-                INSERT INTO dbo.AuthorityRank 
-                    (JobTitle, NormalizedJobTitle, Department, NormalizedDepartment, AuthorityRank, AuthorityLevel, IsActive)
-                VALUES
-                    ('Chief Executive Officer', 'chief executive officer', 'Executive', 'executive', 5, 'Executive Authority', 1),
-                    ('Chief Financial Officer', 'chief financial officer', 'Finance', 'finance', 5, 'Executive Authority', 1),
-                    ('Finance Director', 'finance director', 'Finance', 'finance', 4, 'Senior Authority', 1),
-                    ('VP of Finance', 'vp of finance', 'Finance', 'finance', 4, 'Senior Authority', 1),
-                    ('Finance Manager', 'finance manager', 'Finance', 'finance', 3, 'Manager Authority', 1),
-                    ('HR Manager', 'hr manager', 'Human Resources', 'human resources', 3, 'Manager Authority', 1),
-                    ('Senior Financial Analyst', 'senior financial analyst', 'Finance', 'finance', 2, 'Intermediate Authority', 1),
-                    ('Senior HR Specialist', 'senior hr specialist', 'Human Resources', 'human resources', 2, 'Intermediate Authority', 1),
-                    ('Financial Analyst', 'financial analyst', 'Finance', 'finance', 1, 'Entry-level Authority', 1),
-                    ('HR Assistant', 'hr assistant', 'Human Resources', 'human resources', 1, 'Entry-level Authority', 1);
-            END;
-
-            -- 7. EmployeeDetails Table (Phase 1 Employee Authority Module)
-            IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'EmployeeDetails')
-            BEGIN
-                CREATE TABLE dbo.EmployeeDetails (
-                    EmployeeId INT IDENTITY(1,1) PRIMARY KEY,
-                    EmployeeName NVARCHAR(150) NOT NULL,
-                    Email NVARCHAR(255) NOT NULL,
-                    NormalizedEmail NVARCHAR(255) NOT NULL,
-                    EntraObjectId NVARCHAR(255) NULL,
-                    JobTitle NVARCHAR(150) NULL,
-                    NormalizedJobTitle NVARCHAR(150) NULL,
-                    Department NVARCHAR(100) NULL,
-                    NormalizedDepartment NVARCHAR(100) NULL,
-                    AuthorityRankId INT NULL FOREIGN KEY REFERENCES dbo.AuthorityRank(Id),
-                    IsActive BIT NOT NULL DEFAULT 1,
-                    CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
-                    UpdatedAt DATETIME2 NULL
-                );
-
-                CREATE UNIQUE INDEX UX_EmployeeDetails_NormalizedEmail ON dbo.EmployeeDetails(NormalizedEmail);
-                CREATE INDEX IX_EmployeeDetails_AuthorityRankId ON dbo.EmployeeDetails(AuthorityRankId);
-                CREATE INDEX IX_EmployeeDetails_EntraObjectId ON dbo.EmployeeDetails(EntraObjectId);
             END;
         `);
         schemaInitialized = true;
     } catch (err) {
-        console.error('Critical Error: Database schema initialization / migration failed:', err.message);
-        throw err;
+        /// Log warning if schema check cannot run yet (e.g. read-only user or initial probe)
+        console.warn('Notice: Automatic database schema initialization encountered an issue:', err.message);
     }
 }
 

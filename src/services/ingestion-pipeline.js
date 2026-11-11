@@ -48,7 +48,8 @@ async function processDocumentIngestion({
     modifiedDate = null,
     authoritySource = null,
     existingRunId = null,
-    manageRun = null
+    manageRun = null,
+    existingDocumentId = null
 }) {
     const corrId = correlationId || `ingest-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
     const log = (msg) => (context.log ? context.log(`[${corrId}] ${msg}`) : console.log(`[${corrId}] ${msg}`));
@@ -64,7 +65,7 @@ async function processDocumentIngestion({
         currentStep = 'STEP 1: VALIDATION & SCOPE ENFORCEMENT';
         log(`=== ${currentStep} ===`);
 
-        validateDocumentBuffer(fileBuffer, fileName);
+        await validateDocumentBuffer(fileBuffer, fileName);
 
         log(`Step 1 Output: File "${fileName}" validated successfully (${(fileBuffer.length / 1024).toFixed(1)} KB, Rank ${authorityRank}).`);
 
@@ -72,10 +73,14 @@ async function processDocumentIngestion({
         currentStep = 'STEP 2: INGESTION LIFECYCLE REGISTRATION (AZURE SQL)';
         log(`=== ${currentStep} ===`);
 
-        if (shouldManageRun) {
+        if (shouldManageRun && !runId) {
             runId = await startIngestionRun(1);
         }
-        documentId = await createDocument(fileName, sourceType, authorityRank, allowedUserGroups);
+        if (existingDocumentId) {
+            documentId = existingDocumentId;
+        } else {
+            documentId = await createDocument(fileName, sourceType, authorityRank, allowedUserGroups);
+        }
 
         log(`Step 2 Output: dbo.IngestionRuns ID=${runId || 'N/A'}, dbo.Documents ID=${documentId} (Status: Processing).`);
 

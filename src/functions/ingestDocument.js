@@ -3,6 +3,12 @@ const { validateDocumentBuffer } = require('../utils/validation');
 const { ValidationError, toErrorResponse } = require('../utils/errors');
 const { processDocumentIngestion } = require('../services/ingestion-pipeline');
 const { blankToNull } = require('../services/search-document');
+const {
+    createDocument,
+    startIngestionRun,
+    updateIngestionRunProgress,
+    completeIngestionRun
+} = require('../services/sql');
 
 function firstText(...values) {
     for (const value of values) {
@@ -10,6 +16,22 @@ function firstText(...values) {
         if (text) return text;
     }
     return null;
+}
+
+const CONCURRENCY_LIMIT = 3;
+
+/**
+ * Creates a background-safe logger detached from the HTTP invocation context.
+ * Prevents Azure Functions "Warning: Unexpected call to 'log' on the context object after function execution has completed."
+ */
+function createBackgroundLogger(correlationId) {
+    const ts = () => new Date().toISOString();
+    return {
+        log: (msg) => console.log(`[${ts()}] [${correlationId}] ${msg}`),
+        warn: (msg) => console.warn(`[${ts()}] [${correlationId}] [WARN] ${msg}`),
+        error: (msg) => console.error(`[${ts()}] [${correlationId}] [ERROR] ${msg}`),
+        info: (msg) => console.info(`[${ts()}] [${correlationId}] ${msg}`)
+    };
 }
 
 app.http('ingestDocument', {
@@ -23,29 +45,29 @@ app.http('ingestDocument', {
             context.log(`[${correlationId}] === STEP 1: VALIDATION & INPUT EXTRACTION ===`);
 
             const contentType = (request.headers.get('content-type') || '').toLowerCase();
-            let fileBuffer;
+            const filesToProcess = [];
 
             // 1. Extract filename from query string (case-insensitive)
-            let fileName = null;
+            let defaultFileName = null;
             if (request.query) {
                 for (const [key, val] of request.query.entries()) {
                     if (/^(filename|name|file|title)$/i.test(key) && val) {
-                        fileName = decodeURIComponent(val).trim();
+                        defaultFileName = decodeURIComponent(val).trim();
                         break;
                     }
                 }
             }
 
             // 2. Check headers (x-filename, x-file-name, content-disposition)
-            if (!fileName) {
+            if (!defaultFileName) {
                 const xFn = request.headers.get('x-filename') || request.headers.get('x-file-name');
-                if (xFn) fileName = decodeURIComponent(xFn).trim();
+                if (xFn) defaultFileName = decodeURIComponent(xFn).trim();
             }
 
-            if (!fileName) {
+            if (!defaultFileName) {
                 const disp = request.headers.get('content-disposition') || '';
                 const match = disp.match(/filename\*?=['"]?(?:UTF-\d['"]*)?([^;\r\n"']*)['"]?/i);
-                if (match && match[1]) fileName = decodeURIComponent(match[1]).trim();
+                if (match && match[1]) defaultFileName = decodeURIComponent(match[1]).trim();
             }
 
             let allowedUserGroups = request.query.get('allowedUserGroups') || request.headers.get('x-user-groups') || null;
@@ -58,27 +80,25 @@ app.http('ingestDocument', {
             let jobTitle = firstText(request.query.get('jobTitle'), request.headers.get('x-job-title'));
             let modifiedDate = firstText(request.query.get('modifiedDate'), request.headers.get('x-modified-date'));
 
+            // Check async parameter (?async=false allows synchronous mode if explicitly requested)
+            const isAsync = request.query.get('async') !== 'false' && request.headers.get('x-async') !== 'false';
+
             if (contentType.includes('text/plain') || contentType.includes('text/markdown') || contentType.includes('text/csv')) {
                 const textContent = await request.text();
-                fileBuffer = Buffer.from(textContent, 'utf8');
-                fileName = fileName || `report_${Date.now()}.${contentType.includes('csv') ? 'csv' : 'txt'}`;
+                const fileBuffer = Buffer.from(textContent, 'utf8');
+                const fileName = defaultFileName || `report_${Date.now()}.${contentType.includes('csv') ? 'csv' : 'txt'}`;
+                filesToProcess.push({ fileBuffer, fileName });
             } else if (contentType.includes('application/pdf') ||
                 contentType.includes('application/octet-stream') ||
                 contentType.includes('spreadsheetml') ||
                 contentType.includes('ms-excel')) {
                 const arrayBuffer = await request.arrayBuffer();
-                fileBuffer = Buffer.from(arrayBuffer);
+                const fileBuffer = Buffer.from(arrayBuffer);
+                filesToProcess.push({ fileBuffer, fileName: defaultFileName });
             } else if (contentType.includes('multipart/form-data')) {
                 const formData = await request.formData();
-                const file = formData.get('file') || formData.get('document');
-                if (file && typeof file.arrayBuffer === 'function') {
-                    const arrayBuffer = await file.arrayBuffer();
-                    fileBuffer = Buffer.from(arrayBuffer);
-                    fileName = fileName || file.name;
-                } else {
-                    throw new ValidationError('form-data request must include a "file" or "document" field with an uploaded file.');
-                }
-                if (formData.get('fileName')) fileName = formData.get('fileName');
+
+                // Metadata overrides from form fields
                 if (formData.get('allowedUserGroups')) allowedUserGroups = formData.get('allowedUserGroups');
                 if (formData.get('authorityRank')) authorityRank = Number(formData.get('authorityRank'));
                 if (formData.get('sourceType')) sourceType = formData.get('sourceType');
@@ -88,11 +108,29 @@ app.http('ingestDocument', {
                 department = firstText(formData.get('department'), department);
                 jobTitle = firstText(formData.get('jobTitle'), jobTitle);
                 modifiedDate = firstText(formData.get('modifiedDate'), modifiedDate);
+
+                // Collect all files uploaded in formData (supports single and multiple files)
+                for (const [key, val] of formData.entries()) {
+                    if (val && typeof val.arrayBuffer === 'function') {
+                        const arrayBuffer = await val.arrayBuffer();
+                        const fileBuffer = Buffer.from(arrayBuffer);
+                        let fn = val.name || null;
+                        filesToProcess.push({ fileBuffer, fileName: fn });
+                    }
+                }
+
+                if (filesToProcess.length === 1 && formData.get('fileName')) {
+                    filesToProcess[0].fileName = formData.get('fileName');
+                }
+
+                if (filesToProcess.length === 0) {
+                    throw new ValidationError('form-data request must include one or more files in "file", "document", or "files" fields.');
+                }
             } else if (contentType.includes('application/json')) {
                 const jsonBody = await request.json().catch(() => null);
                 if (!jsonBody) throw new ValidationError('JSON body is malformed or empty.');
 
-                fileName = fileName || jsonBody.fileName || jsonBody.filename;
+                let fileName = defaultFileName || jsonBody.fileName || jsonBody.filename;
                 allowedUserGroups = allowedUserGroups || jsonBody.allowedUserGroups || null;
                 if (jsonBody.authorityRank) authorityRank = Number(jsonBody.authorityRank);
                 if (jsonBody.sourceType) sourceType = jsonBody.sourceType;
@@ -103,6 +141,7 @@ app.http('ingestDocument', {
                 jobTitle = firstText(jsonBody.jobTitle, jobTitle);
                 modifiedDate = firstText(jsonBody.modifiedDate, modifiedDate);
 
+                let fileBuffer;
                 if (jsonBody.text || jsonBody.content) {
                     fileBuffer = Buffer.from(jsonBody.text || jsonBody.content, 'utf8');
                     fileName = fileName || `report_${Date.now()}.txt`;
@@ -111,59 +150,197 @@ app.http('ingestDocument', {
                 } else {
                     throw new ValidationError('JSON request must include "text", "content", or "base64".');
                 }
+                filesToProcess.push({ fileBuffer, fileName });
             } else {
                 throw new ValidationError(`Unsupported Content-Type: "${contentType}". Finora AI accepts form-data, PDF/Binary, CSV, Excel (.xlsx/.xls), Text, or JSON.`);
             }
 
-            // Auto-detect format and append extension if missing
-            const isPdf = fileBuffer && fileBuffer.length >= 4 && fileBuffer.toString('utf8', 0, 4) === '%PDF';
-            const isZipOrExcel = fileBuffer && fileBuffer.length >= 4 && fileBuffer.toString('hex', 0, 4) === '504b0304';
+            // Sanitize file names and validate each buffer upfront synchronously
+            for (let i = 0; i < filesToProcess.length; i++) {
+                const item = filesToProcess[i];
+                const isPdf = item.fileBuffer && item.fileBuffer.length >= 4 && item.fileBuffer.toString('utf8', 0, 4) === '%PDF';
+                const isZipOrExcel = item.fileBuffer && item.fileBuffer.length >= 4 && item.fileBuffer.toString('hex', 0, 4) === '504b0304';
 
-            if (fileName) {
-                if (!fileName.includes('.')) {
-                    if (isPdf) fileName += '.pdf';
-                    else if (isZipOrExcel) fileName += '.xlsx';
-                    else if (contentType.includes('csv')) fileName += '.csv';
-                    else fileName += '.txt';
+                if (item.fileName) {
+                    if (!item.fileName.includes('.')) {
+                        if (isPdf) item.fileName += '.pdf';
+                        else if (isZipOrExcel) item.fileName += '.xlsx';
+                        else if (contentType.includes('csv')) item.fileName += '.csv';
+                        else item.fileName += '.txt';
+                    }
+                } else {
+                    const timestamp = Date.now() + i;
+                    if (isPdf) item.fileName = `document_${timestamp}.pdf`;
+                    else if (isZipOrExcel) item.fileName = `spreadsheet_${timestamp}.xlsx`;
+                    else if (contentType.includes('csv')) item.fileName = `data_${timestamp}.csv`;
+                    else item.fileName = `document_${timestamp}.txt`;
                 }
-            } else {
-                const timestamp = Date.now();
-                if (isPdf) fileName = `document_${timestamp}.pdf`;
-                else if (isZipOrExcel) fileName = `spreadsheet_${timestamp}.xlsx`;
-                else if (contentType.includes('csv')) fileName = `data_${timestamp}.csv`;
-                else fileName = `document_${timestamp}.txt`;
+
+                await validateDocumentBuffer(item.fileBuffer, item.fileName);
+                context.log(`[${correlationId}] File [${i + 1}/${filesToProcess.length}] validated: "${item.fileName}" (${(item.fileBuffer.length / 1024).toFixed(1)} KB).`);
             }
 
-            validateDocumentBuffer(fileBuffer, fileName);
+            // -------------------------------------------------------------------------
+            // ASYNCHRONOUS INGESTION (DEFAULT)
+            // -------------------------------------------------------------------------
+            if (isAsync) {
+                // Pre-register all documents in Azure SQL immediately (Status: Processing)
+                const registeredDocs = [];
+                for (const item of filesToProcess) {
+                    const docId = await createDocument(item.fileName, sourceType, authorityRank, allowedUserGroups);
+                    registeredDocs.push({
+                        documentId: docId,
+                        fileName: item.fileName,
+                        fileBuffer: item.fileBuffer,
+                        status: 'Processing'
+                    });
+                    context.log(`[${correlationId}] Pre-registered DocumentId=${docId} for "${item.fileName}" (Status: Processing)`);
+                }
 
-            context.log(`[${correlationId}] Step 1 Output: Buffer validated successfully.`);
-            context.log(`[${correlationId}]   - Resolved FileName: "${fileName}"`);
-            context.log(`[${correlationId}]   - File Size: ${fileBuffer.length} bytes (${(fileBuffer.length / 1024).toFixed(1)} KB)`);
-            context.log(`[${correlationId}]   - Authority Rank: ${authorityRank}`);
-            context.log(`[${correlationId}]   - Source Type: "${sourceType}"`);
-            context.log(`[${correlationId}]   - Content-Type: "${contentType}"`);
+                let batchRunId = null;
+                try {
+                    batchRunId = await startIngestionRun(registeredDocs.length);
+                    context.log(`[${correlationId}] Initialized IngestionRun ID=${batchRunId} for ${registeredDocs.length} file(s).`);
+                } catch (runErr) {
+                    context.warn?.(`[${correlationId}] Notice: Failed to register IngestionRun: ${runErr.message}`);
+                }
 
-            const result = await processDocumentIngestion({
-                fileBuffer,
-                fileName,
-                sourceType,
-                authorityRank,
-                allowedUserGroups,
-                correlationId,
-                context,
-                documentKey,
-                queueKey,
-                fileLink,
-                department,
-                jobTitle,
-                modifiedDate
-            });
+                // Fire-and-forget background worker pool using background-safe logger
+                (async () => {
+                    const batchLogger = createBackgroundLogger(correlationId);
+                    let succeededCount = 0;
+                    let failedCount = 0;
+                    const errors = [];
+                    let cursor = 0;
+                    const poolSize = Math.min(CONCURRENCY_LIMIT, registeredDocs.length);
+
+                    const workers = Array.from({ length: poolSize }, async () => {
+                        while (cursor < registeredDocs.length) {
+                            const doc = registeredDocs[cursor++];
+                            const itemCorrId = `${correlationId}-${doc.documentId}`;
+                            const docLogger = createBackgroundLogger(itemCorrId);
+                            try {
+                                docLogger.log(`[AsyncIngest] Starting ingestion for DocumentId=${doc.documentId} ("${doc.fileName}")...`);
+                                await processDocumentIngestion({
+                                    fileBuffer: doc.fileBuffer,
+                                    fileName: doc.fileName,
+                                    sourceType,
+                                    authorityRank,
+                                    allowedUserGroups,
+                                    correlationId: itemCorrId,
+                                    context: docLogger,
+                                    documentKey,
+                                    queueKey,
+                                    fileLink,
+                                    department,
+                                    jobTitle,
+                                    modifiedDate,
+                                    existingRunId: batchRunId,
+                                    manageRun: false,
+                                    existingDocumentId: doc.documentId
+                                });
+                                succeededCount++;
+                                if (batchRunId) {
+                                    await updateIngestionRunProgress(batchRunId, true).catch(() => null);
+                                }
+                                docLogger.log(`[AsyncIngest] Ingestion completed for DocumentId=${doc.documentId}.`);
+                            } catch (docErr) {
+                                failedCount++;
+                                errors.push(`${doc.fileName}: ${docErr.message}`);
+                                if (batchRunId) {
+                                    await updateIngestionRunProgress(batchRunId, false, `${doc.fileName}: ${docErr.message}`).catch(() => null);
+                                }
+                                docLogger.error(`[AsyncIngest] Ingestion failed for DocumentId=${doc.documentId}: ${docErr.message}`);
+                            }
+                        }
+                    });
+
+                    await Promise.all(workers);
+
+                    if (batchRunId) {
+                        const overallStatus = failedCount === 0 ? 'Succeeded' : (succeededCount === 0 ? 'Failed' : 'CompletedWithErrors');
+                        const summary = errors.length > 0 ? errors.slice(0, 5).join(' | ') : null;
+                        await completeIngestionRun(batchRunId, succeededCount, failedCount, overallStatus, summary).catch(() => null);
+                    }
+                    batchLogger.log(`[AsyncIngest] Batch finished. Succeeded=${succeededCount}, Failed=${failedCount}.`);
+                })().catch(unhandled => {
+                    const fallbackLogger = createBackgroundLogger(correlationId);
+                    fallbackLogger.error(`[AsyncIngest] Unhandled background error: ${unhandled.message}`);
+                });
+
+                const firstDoc = registeredDocs[0];
+                const responseBody = {
+                    status: 'Accepted',
+                    ingestionStatus: 'Processing',
+                    documentId: firstDoc.documentId,
+                    fileName: firstDoc.fileName,
+                    documents: registeredDocs.map(d => ({
+                        documentId: d.documentId,
+                        fileName: d.fileName,
+                        status: 'Processing'
+                    })),
+                    totalSubmitted: registeredDocs.length,
+                    runId: batchRunId,
+                    message: registeredDocs.length === 1
+                        ? `Document "${firstDoc.fileName}" accepted for asynchronous ingestion. Use GET /api/getIngestionStatus?documentId=${firstDoc.documentId} to check status.`
+                        : `${registeredDocs.length} documents accepted for asynchronous ingestion. Use GET /api/getIngestionStatus?documentId=<id> to check status.`,
+                    statusUrl: `/api/getIngestionStatus?documentId=${firstDoc.documentId}`,
+                    correlationId
+                };
+
+                return {
+                    status: 202,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Location': `/api/getIngestionStatus?documentId=${firstDoc.documentId}`
+                    },
+                    body: JSON.stringify(responseBody)
+                };
+            }
+
+            // -------------------------------------------------------------------------
+            // SYNCHRONOUS INGESTION (ONLY WHEN ?async=false)
+            // -------------------------------------------------------------------------
+            context.log(`[${correlationId}] Running in synchronous mode (?async=false)...`);
+            const syncResults = [];
+            for (const item of filesToProcess) {
+                const res = await processDocumentIngestion({
+                    fileBuffer: item.fileBuffer,
+                    fileName: item.fileName,
+                    sourceType,
+                    authorityRank,
+                    allowedUserGroups,
+                    correlationId,
+                    context,
+                    documentKey,
+                    queueKey,
+                    fileLink,
+                    department,
+                    jobTitle,
+                    modifiedDate
+                });
+                syncResults.push(res);
+            }
+
+            if (syncResults.length === 1) {
+                return {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(syncResults[0])
+                };
+            }
 
             return {
                 status: 200,
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(result)
+                body: JSON.stringify({
+                    status: 'success',
+                    documents: syncResults,
+                    totalProcessed: syncResults.length,
+                    correlationId
+                })
             };
+
         } catch (err) {
             context.error(`[${correlationId}] !!! INGESTION FAILED !!!`);
             context.error(`[${correlationId}] Error Name: ${err.name || 'Error'}`);
