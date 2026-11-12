@@ -1,3 +1,4 @@
+require('../utils/config');
 const { areValuesEqual } = require('./unit-normalizer');
 const { getPool } = require('./sql');
 
