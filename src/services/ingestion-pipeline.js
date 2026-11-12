@@ -145,14 +145,15 @@ async function processDocumentIngestion({
         currentStep = 'STEP 7: RETRIEVAL CHUNKING';
         log(`=== ${currentStep} ===`);
 
-        const chunks = createChunks(normalized, fileName, null, null, { queueKey });
-        log(`Step 7 Output (Created Chunks): ${chunks.length} retrieval chunk(s).`);
+        const chunks = createChunks(normalized, fileName, null, null, { queueKey, logger: log });
+        log(`Step 7 Output (Created Chunks): Produced ${chunks.length} retrieval chunk(s).`);
         if (chunks.length > 0) {
-            log(`  - Chunk 0: ID="${chunks[0].id}", Title="${chunks[0].title}", Length=${chunks[0].content.length} chars`);
-            if (chunks.length > 1) {
-                const lastIdx = chunks.length - 1;
-                log(`  - Chunk ${lastIdx}: ID="${chunks[lastIdx].id}", Title="${chunks[lastIdx].title}", Length=${chunks[lastIdx].content.length} chars`);
-            }
+            chunks.forEach((c, idx) => {
+                const header = c.content.split('\n')[0] || '';
+                log(`  - Chunk ${idx} [${(c.chunk_type || 'section').toUpperCase()}]: ID="${c.id}", Title="${c.title}"`);
+                log(`    Context Prefix: ${header}`);
+                log(`    Length: ${c.content.length} chars | Page: ${c.pageNumber || c.metadata?.page_start || 1}`);
+            });
         }
 
         // STEP 8 & 9: MULTILINGUAL EMBEDDINGS & AZURE AI SEARCH INDEXING

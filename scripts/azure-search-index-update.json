@@ -1,0 +1,42 @@
+{
+  "$comment": "Azure AI Search index update definition for service 'finchat-search-unique', index 'finance-hr-documents'. Do NOT run directly without review.",
+  "indexName": "finance-hr-documents",
+  "apiVersion": "2024-07-01",
+  "fieldsToAdd": [
+    { "name": "document_id", "type": "Edm.String", "searchable": false, "filterable": true, "sortable": false, "facetable": false, "retrievable": true },
+    { "name": "document_family_id", "type": "Edm.String", "searchable": false, "filterable": true, "sortable": false, "facetable": false, "retrievable": true },
+    { "name": "chunk_type", "type": "Edm.String", "searchable": false, "filterable": true, "sortable": false, "facetable": false, "retrievable": true },
+    { "name": "entity", "type": "Edm.String", "searchable": true, "filterable": true, "sortable": false, "facetable": false, "retrievable": true },
+    { "name": "document_type", "type": "Edm.String", "searchable": false, "filterable": true, "sortable": false, "facetable": false, "retrievable": true },
+    { "name": "period_label", "type": "Edm.String", "searchable": false, "filterable": true, "sortable": false, "facetable": false, "retrievable": true },
+    { "name": "basis", "type": "Edm.String", "searchable": false, "filterable": true, "sortable": false, "facetable": false, "retrievable": true },
+    { "name": "status", "type": "Edm.String", "searchable": false, "filterable": true, "sortable": false, "facetable": false, "retrievable": true },
+    { "name": "currency", "type": "Edm.String", "searchable": false, "filterable": true, "sortable": false, "facetable": false, "retrievable": true },
+    { "name": "language", "type": "Edm.String", "searchable": false, "filterable": true, "sortable": false, "facetable": false, "retrievable": true },
+    { "name": "section_title", "type": "Edm.String", "searchable": true, "filterable": true, "sortable": false, "facetable": false, "retrievable": true },
+    { "name": "table_id", "type": "Edm.String", "searchable": false, "filterable": true, "sortable": false, "facetable": false, "retrievable": true },
+    { "name": "supersedes", "type": "Edm.String", "searchable": false, "filterable": true, "sortable": false, "facetable": false, "retrievable": true },
+    { "name": "superseded_by", "type": "Edm.String", "searchable": false, "filterable": true, "sortable": false, "facetable": false, "retrievable": true },
+    { "name": "chunk_index", "type": "Edm.Int32", "searchable": false, "filterable": true, "sortable": true, "facetable": false, "retrievable": true },
+    { "name": "version", "type": "Edm.Int32", "searchable": false, "filterable": true, "sortable": true, "facetable": false, "retrievable": true },
+    { "name": "page_start", "type": "Edm.Int32", "searchable": false, "filterable": true, "sortable": true, "facetable": false, "retrievable": true },
+    { "name": "page_end", "type": "Edm.Int32", "searchable": false, "filterable": true, "sortable": true, "facetable": false, "retrievable": true },
+    { "name": "table_part", "type": "Edm.Int32", "searchable": false, "filterable": true, "sortable": true, "facetable": false, "retrievable": true },
+    { "name": "table_parts", "type": "Edm.Int32", "searchable": false, "filterable": true, "sortable": true, "facetable": false, "retrievable": true },
+    { "name": "chunk_count", "type": "Edm.Int32", "searchable": false, "filterable": true, "sortable": true, "facetable": false, "retrievable": true },
+    { "name": "audited", "type": "Edm.Boolean", "searchable": false, "filterable": true, "sortable": false, "facetable": false, "retrievable": true },
+    { "name": "is_latest", "type": "Edm.Boolean", "searchable": false, "filterable": true, "sortable": false, "facetable": false, "retrievable": true },
+    { "name": "period_end", "type": "Edm.DateTimeOffset", "searchable": false, "filterable": true, "sortable": true, "facetable": false, "retrievable": true },
+    { "name": "prepared_date", "type": "Edm.DateTimeOffset", "searchable": false, "filterable": true, "sortable": true, "facetable": false, "retrievable": true },
+    { "name": "access_tags", "type": "Collection(Edm.String)", "searchable": false, "filterable": true, "sortable": false, "facetable": false, "retrievable": true },
+    { "name": "search_text", "type": "Edm.String", "searchable": true, "filterable": false, "sortable": false, "facetable": false, "retrievable": true }
+  ],
+  "restApiInstructions": [
+    "1. Obtain your Azure AI Search admin key and endpoint.",
+    "2. GET https://<search-service>.search.windows.net/indexes/finance-hr-documents?api-version=2024-07-01 with header 'api-key: <admin-key>'.",
+    "3. Append the fields above to the 'fields' array of the retrieved JSON.",
+    "4. PUT https://<search-service>.search.windows.net/indexes/finance-hr-documents?api-version=2024-07-01 with header 'api-key: <admin-key>' and Content-Type: application/json using the updated JSON payload.",
+    "5. Note: Vector dimension must remain 1536 for text-embedding-3-small."
+  ]
+}
+
