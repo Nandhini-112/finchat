@@ -19,7 +19,7 @@ const {
 const { detectAndResolveConflicts } = require('./conflict-resolver');
 
 /**
- * Orchestrates the full 10-step enterprise ingestion pipeline.
+ * Orchestrates the full 10-step enterprise ingestion pipeline with rich status-tracking telemetry.
  * Used by both HTTP ingestion endpoint (ingestDocument) and 
  * scheduled SharePoint queue processor (processDocumentQueue).
  * 
@@ -51,6 +51,7 @@ async function processDocumentIngestion({
     manageRun = null,
     existingDocumentId = null
 }) {
+    const pipelineStartTime = Date.now();
     const corrId = correlationId || `ingest-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
     const log = (msg) => (context.log ? context.log(`[${corrId}] ${msg}`) : console.log(`[${corrId}] ${msg}`));
     const errorLog = (msg) => (context.error ? context.error(`[${corrId}] ${msg}`) : console.error(`[${corrId}] ${msg}`));
@@ -58,115 +59,151 @@ async function processDocumentIngestion({
     const shouldManageRun = manageRun !== null ? Boolean(manageRun) : (existingRunId === null);
     let currentStep = 'INITIALIZATION';
     let runId = existingRunId || null;
-    let documentId = null;
+    let documentId = existingDocumentId || null;
+    let stepStartTime = Date.now();
+
+    log(`[INGEST_STATUS: PIPELINE_START] File="${fileName}", Size=${fileBuffer ? (fileBuffer.length / 1024).toFixed(1) : 0} KB, AuthorityRank=${authorityRank}, SourceType="${sourceType}", UserGroups=${allowedUserGroups || 'Public'}`);
 
     try {
+        // =========================================================================
         // STEP 1: VALIDATION & SCOPE ENFORCEMENT
+        // =========================================================================
         currentStep = 'STEP 1: VALIDATION & SCOPE ENFORCEMENT';
+        stepStartTime = Date.now();
         log(`=== ${currentStep} ===`);
+        log(`[INGEST_STATUS: VALIDATING] Step 1/10: Validating document header signature, format scope, and size...`);
 
         await validateDocumentBuffer(fileBuffer, fileName);
 
-        log(`Step 1 Output: File "${fileName}" validated successfully (${(fileBuffer.length / 1024).toFixed(1)} KB, Rank ${authorityRank}).`);
+        log(`[INGEST_STATUS: VALIDATED] Step 1/10: File "${fileName}" passed format validation (${(fileBuffer.length / 1024).toFixed(1)} KB, Rank ${authorityRank}) in ${Date.now() - stepStartTime}ms.`);
 
+        // =========================================================================
         // STEP 2: INGESTION LIFECYCLE REGISTRATION (AZURE SQL)
+        // =========================================================================
         currentStep = 'STEP 2: INGESTION LIFECYCLE REGISTRATION (AZURE SQL)';
+        stepStartTime = Date.now();
         log(`=== ${currentStep} ===`);
+        log(`[INGEST_STATUS: SQL_REGISTERING] Step 2/10: Registering ingestion run and document status in Azure SQL...`);
 
         if (shouldManageRun && !runId) {
             runId = await startIngestionRun(1);
         }
-        if (existingDocumentId) {
-            documentId = existingDocumentId;
-        } else {
+        if (!documentId) {
             documentId = await createDocument(fileName, sourceType, authorityRank, allowedUserGroups);
         }
 
-        log(`Step 2 Output: dbo.IngestionRuns ID=${runId || 'N/A'}, dbo.Documents ID=${documentId} (Status: Processing).`);
+        log(`[INGEST_STATUS: SQL_REGISTERED] Step 2/10: Registered dbo.IngestionRuns ID=${runId || 'Batch'}, dbo.Documents ID=${documentId} (Status: 'Processing') in ${Date.now() - stepStartTime}ms.`);
 
+        // =========================================================================
         // STEP 3: DOCUMENT EXTRACTION (PDF / EXCEL EXTRACTOR)
+        // =========================================================================
         currentStep = 'STEP 3: DOCUMENT EXTRACTION (PDF / EXCEL)';
+        stepStartTime = Date.now();
         log(`=== ${currentStep} ===`);
+        log(`[INGEST_STATUS: EXTRACTING] Step 3/10: Extracting text, paragraphs, and table layouts...`);
 
         const docIntelResult = await analyzeDocument(fileBuffer, fileName);
         const extractedPages = docIntelResult.pages || [];
         const extractedTables = docIntelResult.tables || [];
         const rawContentLen = (docIntelResult.content || '').length;
 
-        log(`Step 3 Output: Extracted ${extractedPages.length} page(s), ${extractedTables.length} table(s), ${rawContentLen} chars text.`);
+        log(`[INGEST_STATUS: EXTRACTED] Step 3/10: Extracted ${extractedPages.length} page(s), ${extractedTables.length} table(s), ${rawContentLen} raw characters in ${Date.now() - stepStartTime}ms.`);
 
+        // =========================================================================
         // STEP 4: CONTENT NORMALIZATION
+        // =========================================================================
         currentStep = 'STEP 4: CONTENT NORMALIZATION';
+        stepStartTime = Date.now();
         log(`=== ${currentStep} ===`);
+        log(`[INGEST_STATUS: NORMALIZING] Step 4/10: Normalizing cell layout grids, multi-period headers, and markdown...`);
 
         const normalized = normalizeContent(docIntelResult, documentId);
         const normMarkdownLen = (normalized.fullMarkdown || normalized.content || '').length;
 
-        log(`Step 4 Output: Normalized ${normalized.tables.length} table(s), ${normalized.paragraphs.length} paragraph(s) (${normMarkdownLen} chars).`);
+        log(`[INGEST_STATUS: NORMALIZED] Step 4/10: Normalized ${normalized.tables.length} table(s), ${normalized.paragraphs.length} paragraph(s) (${normMarkdownLen} markdown chars) in ${Date.now() - stepStartTime}ms.`);
 
+        // =========================================================================
         // STEP 5: STRUCTURED FACT EXTRACTION (IFRS & HR FIGURES)
+        // =========================================================================
         currentStep = 'STEP 5: STRUCTURED FACT EXTRACTION';
+        stepStartTime = Date.now();
         log(`=== ${currentStep} ===`);
+        log(`[INGEST_STATUS: FACT_EXTRACTING] Step 5/10: Mapping normalized financial rows to canonical facts and unit metrics...`);
 
         const extractedFacts = extractFinancialFacts(normalized);
-        log(`Step 5 Output (Extracted Facts Count): ${extractedFacts.length}`);
+        log(`[INGEST_STATUS: FACT_EXTRACTED] Step 5/10: Extracted ${extractedFacts.length} structured fact(s) in ${Date.now() - stepStartTime}ms.`);
+
         if (extractedFacts.length > 0) {
             const sampleLimit = Math.min(extractedFacts.length, 4);
             log(`Step 5 Fact Samples (First ${sampleLimit}):`);
             for (let i = 0; i < sampleLimit; i++) {
                 const f = extractedFacts[i];
-                log(`  [Fact ${i + 1}] Metric="${f.metric}", Entity="${f.entity || 'N/A'}", Value=${f.numericValue ?? f.textValue} ${f.currency || f.unit || ''}, Location="${f.sourceLocation || 'N/A'}"`);
+                log(`  [Fact ${i + 1}] Metric="${f.metric}" (Canonical="${f.canonicalMetric || 'Unmapped'}"), Period="${f.periodLabel}", Val=${f.numericValue ?? f.textValue} ${f.currency || f.unit || ''}, Status=${f.validationStatus || 'Pending'}`);
             }
         } else {
             log('Step 5 Notice: No structured financial metrics discovered in document text/tables.');
         }
 
+        // =========================================================================
         // STEP 6: FACT PERSISTENCE & CONFLICT AUDITING (AZURE SQL)
+        // =========================================================================
         currentStep = 'STEP 6: FACT PERSISTENCE & CONFLICT AUDITING';
+        stepStartTime = Date.now();
         log(`=== ${currentStep} ===`);
+        log(`[INGEST_STATUS: PERSISTING] Step 6/10: Persisting structured facts into dbo.FinancialFacts and auditing conflicts...`);
 
         let conflicts = [];
         if (extractedFacts.length > 0) {
             const insertedCount = await insertFinancialFacts(documentId, extractedFacts, authorityRank, fileName);
-            log(`Step 6 Output (dbo.FinancialFacts): Inserted ${insertedCount.length || extractedFacts.length} row(s).`);
+            log(`[INGEST_STATUS: FACTS_STORED] Step 6/10: Persisted ${insertedCount.length || extractedFacts.length} row(s) to dbo.FinancialFacts for DocumentId=${documentId}.`);
 
             conflicts = await detectAndResolveConflicts(documentId);
-            log(`Step 6 Output (dbo.FactConflicts): Discovered & registered ${conflicts.length} conflict(s).`);
+            log(`[INGEST_STATUS: CONFLICTS_EVALUATED] Step 6/10: Audited conflicts across corpus; found ${conflicts.length} active conflict(s) in ${Date.now() - stepStartTime}ms.`);
             if (conflicts.length > 0) {
                 for (const c of conflicts) {
-                    log(`  - Discrepancy on "${c.fact1?.Metric}": ${c.status} (${c.fact1?.SourceFileName}: ${c.fact1?.NumericValue} vs ${c.fact2?.SourceFileName}: ${c.fact2?.NumericValue})`);
+                    log(`  - Conflict on "${c.fact1?.Metric}": Status="${c.status}" (${c.fact1?.SourceFileName}: ${c.fact1?.NumericValue} vs ${c.fact2?.SourceFileName}: ${c.fact2?.NumericValue})`);
                 }
             }
         } else {
             log('Step 6 Output: Skipped SQL fact insertion (0 facts extracted).');
         }
 
-        /// STEP 7: RETRIEVAL CHUNKING
+        // =========================================================================
+        // STEP 7: RETRIEVAL CHUNKING
+        // =========================================================================
         currentStep = 'STEP 7: RETRIEVAL CHUNKING';
+        stepStartTime = Date.now();
         log(`=== ${currentStep} ===`);
+        log(`[INGEST_STATUS: CHUNKING] Step 7/10: Partitioning normalized content into semantically coherent retrieval chunks...`);
 
-        const chunks = createChunks(normalized, fileName, null, null, { queueKey });
-        log(`Step 7 Output (Created Chunks): ${chunks.length} retrieval chunk(s).`);
+        const chunks = createChunks(normalized, fileName, null, null, { queueKey, logger: log });
+        log(`[INGEST_STATUS: CHUNKED] Step 7/10: Produced ${chunks.length} retrieval chunk(s) in ${Date.now() - stepStartTime}ms.`);
         if (chunks.length > 0) {
-            log(`  - Chunk 0: ID="${chunks[0].id}", Title="${chunks[0].title}", Length=${chunks[0].content.length} chars`);
-            if (chunks.length > 1) {
-                const lastIdx = chunks.length - 1;
-                log(`  - Chunk ${lastIdx}: ID="${chunks[lastIdx].id}", Title="${chunks[lastIdx].title}", Length=${chunks[lastIdx].content.length} chars`);
-            }
+            chunks.forEach((c, idx) => {
+                const header = c.content.split('\n')[0] || '';
+                log(`  - Chunk ${idx} [${(c.chunk_type || 'section').toUpperCase()}]: ID="${c.id}", Title="${c.title}", Length=${c.content.length} chars, Page=${c.pageNumber || c.metadata?.page_start || 1}`);
+            });
         }
 
+        // =========================================================================
         // STEP 8 & 9: MULTILINGUAL EMBEDDINGS & AZURE AI SEARCH INDEXING
+        // =========================================================================
         currentStep = 'STEP 8 & 9: MULTILINGUAL EMBEDDINGS & AZURE AI SEARCH';
+        stepStartTime = Date.now();
         log(`=== ${currentStep} ===`);
 
         if (chunks.length > 0) {
+            log(`[INGEST_STATUS: EMBEDDING] Step 8/10: Generating dense 1536-dim vector embeddings via text-embedding-3-small...`);
             const chunkTexts = chunks.map(c => `${c.title}\n${c.content}`);
             const embeddings = await generateBatchEmbeddings(chunkTexts);
             const vectorDimensions = embeddings[0] ? embeddings[0].length : 0;
 
-            log(`Step 8 Output (Embeddings): Produced ${embeddings.length} vector(s) of ${vectorDimensions} dimensions.`);
+            log(`[INGEST_STATUS: EMBEDDED] Step 8/10: Produced ${embeddings.length} vector embedding(s) (${vectorDimensions} dims) in ${Date.now() - stepStartTime}ms.`);
 
+            stepStartTime = Date.now();
             const searchIndex = process.env.AZURE_SEARCH_INDEX || 'finance-hr-documents';
+            log(`[INGEST_STATUS: SEARCH_INDEXING] Step 9/10: Indexing hybrid vector chunks into Azure AI Search index "${searchIndex}"...`);
+
             const searchMetadata = {
                 documentId,
                 documentVersionId: blankToNull(documentVersionId),
@@ -191,14 +228,18 @@ async function processDocumentIngestion({
                 searchMetadata.documentKey,
                 searchDocuments.map(document => document.id)
             );
-            log(`Step 9 Output (Azure AI Search): Uploaded ${searchDocuments.length} hybrid vector chunk(s) to index "${searchIndex}". Deleted replaced chunks: ${deleted}.`);
+            log(`[INGEST_STATUS: SEARCH_INDEXED] Step 9/10: Uploaded ${searchDocuments.length} chunk(s) to index "${searchIndex}". Deleted superseded chunks: ${deleted} in ${Date.now() - stepStartTime}ms.`);
         } else {
             log('Step 8 & 9 Output: Skipped search indexing (0 chunks).');
         }
 
+        // =========================================================================
         // STEP 10: INGESTION COMPLETION & FINAL STATUS UPDATE
+        // =========================================================================
         currentStep = 'STEP 10: INGESTION COMPLETION';
+        stepStartTime = Date.now();
         log(`=== ${currentStep} ===`);
+        log(`[INGEST_STATUS: FINALIZING] Step 10/10: Transitioning document status to 'Succeeded' in dbo.Documents...`);
 
         await updateDocumentStatus(documentId, 'Succeeded');
         if (shouldManageRun && runId) {
@@ -207,7 +248,9 @@ async function processDocumentIngestion({
         } else {
             log(`Step 10 Output: Ingestion finalized as Succeeded for DocumentId=${documentId} (Batch RunId=${runId || 'N/A'}).`);
         }
-        log(`>>> INGESTION FINISHED SUCCESSFULLY <<< DocumentId=${documentId}, Facts=${extractedFacts.length}, Chunks=${chunks.length}`);
+
+        const totalElapsedMs = Date.now() - pipelineStartTime;
+        log(`[INGEST_STATUS: SUCCEEDED] >>> INGESTION FINISHED SUCCESSFULLY <<< DocumentId=${documentId}, Facts=${extractedFacts.length}, Chunks=${chunks.length}, TotalDuration=${totalElapsedMs}ms.`);
 
         return {
             status: 'success',
@@ -218,11 +261,13 @@ async function processDocumentIngestion({
             factsExtracted: extractedFacts.length,
             chunksIndexed: chunks.length,
             conflictsProcessed: conflicts.length,
+            durationMs: totalElapsedMs,
             correlationId: corrId
         };
 
     } catch (err) {
-        errorLog(`!!! INGESTION FAILED AT [${currentStep}] !!!`);
+        const totalElapsedMs = Date.now() - pipelineStartTime;
+        errorLog(`[INGEST_STATUS: FAILED] !!! INGESTION FAILED AT [${currentStep}] !!! TotalElapsed=${totalElapsedMs}ms`);
         errorLog(`Error Name: ${err.name || 'Error'}`);
         errorLog(`Error Message: ${err.message}`);
         if (err.stack) {
@@ -230,13 +275,14 @@ async function processDocumentIngestion({
         }
 
         if (documentId) {
-            errorLog(`Rolling back partial facts and setting DocumentId=${documentId} status to 'Failed'...`);
+            errorLog(`[INGEST_STATUS: ROLLBACK] Rolling back partial facts and setting DocumentId=${documentId} status to 'Failed'...`);
             await deleteDocumentFacts(documentId).catch(e => {
                 errorLog(`Failed to delete partial facts: ${e.message}`);
             });
             await updateDocumentStatus(documentId, 'Failed').catch(e => {
                 errorLog(`Failed to update document status to Failed: ${e.message}`);
             });
+            errorLog(`[INGEST_STATUS: ROLLBACK_COMPLETE] DocumentId=${documentId} marked as 'Failed' in dbo.Documents.`);
         }
 
         if (shouldManageRun && runId) {
