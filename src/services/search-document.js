@@ -9,6 +9,7 @@ const VECTOR_DIMENSIONS = 1536;
  * Existing fields (id, title, content, source, contentVector) stay unchanged.
  */
 const EXTENDED_INDEX_FIELDS = [
+    // Legacy extended fields
     { name: 'chunkIndex', type: 'Edm.Int32', searchable: false, filterable: true, sortable: true, facetable: false, retrievable: true },
     { name: 'documentId', type: 'Edm.String', searchable: false, filterable: true, sortable: false, facetable: false, retrievable: true },
     { name: 'documentVersionId', type: 'Edm.String', searchable: false, filterable: true, sortable: false, facetable: false, retrievable: true },
@@ -22,7 +23,36 @@ const EXTENDED_INDEX_FIELDS = [
     { name: 'jobTitle', type: 'Edm.String', searchable: true, filterable: true, sortable: false, facetable: false, retrievable: true },
     { name: 'authorityRank', type: 'Edm.Int32', searchable: false, filterable: true, sortable: true, facetable: false, retrievable: true },
     { name: 'authoritySource', type: 'Edm.String', searchable: false, filterable: true, sortable: false, facetable: false, retrievable: true },
-    { name: 'modifiedDate', type: 'Edm.DateTimeOffset', searchable: false, filterable: true, sortable: true, facetable: false, retrievable: true }
+    { name: 'modifiedDate', type: 'Edm.DateTimeOffset', searchable: false, filterable: true, sortable: true, facetable: false, retrievable: true },
+
+    // FinChat Chunking Pipeline New Fields
+    { name: 'document_id', type: 'Edm.String', searchable: false, filterable: true, sortable: false, facetable: false, retrievable: true },
+    { name: 'document_family_id', type: 'Edm.String', searchable: false, filterable: true, sortable: false, facetable: false, retrievable: true },
+    { name: 'chunk_type', type: 'Edm.String', searchable: false, filterable: true, sortable: false, facetable: false, retrievable: true },
+    { name: 'entity', type: 'Edm.String', searchable: true, filterable: true, sortable: false, facetable: false, retrievable: true },
+    { name: 'document_type', type: 'Edm.String', searchable: false, filterable: true, sortable: false, facetable: false, retrievable: true },
+    { name: 'period_label', type: 'Edm.String', searchable: false, filterable: true, sortable: false, facetable: false, retrievable: true },
+    { name: 'basis', type: 'Edm.String', searchable: false, filterable: true, sortable: false, facetable: false, retrievable: true },
+    { name: 'status', type: 'Edm.String', searchable: false, filterable: true, sortable: false, facetable: false, retrievable: true },
+    { name: 'currency', type: 'Edm.String', searchable: false, filterable: true, sortable: false, facetable: false, retrievable: true },
+    { name: 'language', type: 'Edm.String', searchable: false, filterable: true, sortable: false, facetable: false, retrievable: true },
+    { name: 'section_title', type: 'Edm.String', searchable: true, filterable: true, sortable: false, facetable: false, retrievable: true },
+    { name: 'table_id', type: 'Edm.String', searchable: false, filterable: true, sortable: false, facetable: false, retrievable: true },
+    { name: 'supersedes', type: 'Edm.String', searchable: false, filterable: true, sortable: false, facetable: false, retrievable: true },
+    { name: 'superseded_by', type: 'Edm.String', searchable: false, filterable: true, sortable: false, facetable: false, retrievable: true },
+    { name: 'chunk_index', type: 'Edm.Int32', searchable: false, filterable: true, sortable: true, facetable: false, retrievable: true },
+    { name: 'version', type: 'Edm.Int32', searchable: false, filterable: true, sortable: true, facetable: false, retrievable: true },
+    { name: 'page_start', type: 'Edm.Int32', searchable: false, filterable: true, sortable: true, facetable: false, retrievable: true },
+    { name: 'page_end', type: 'Edm.Int32', searchable: false, filterable: true, sortable: true, facetable: false, retrievable: true },
+    { name: 'table_part', type: 'Edm.Int32', searchable: false, filterable: true, sortable: true, facetable: false, retrievable: true },
+    { name: 'table_parts', type: 'Edm.Int32', searchable: false, filterable: true, sortable: true, facetable: false, retrievable: true },
+    { name: 'chunk_count', type: 'Edm.Int32', searchable: false, filterable: true, sortable: true, facetable: false, retrievable: true },
+    { name: 'audited', type: 'Edm.Boolean', searchable: false, filterable: true, sortable: false, facetable: false, retrievable: true },
+    { name: 'is_latest', type: 'Edm.Boolean', searchable: false, filterable: true, sortable: false, facetable: false, retrievable: true },
+    { name: 'period_end', type: 'Edm.DateTimeOffset', searchable: false, filterable: true, sortable: true, facetable: false, retrievable: true },
+    { name: 'prepared_date', type: 'Edm.DateTimeOffset', searchable: false, filterable: true, sortable: true, facetable: false, retrievable: true },
+    { name: 'access_tags', type: 'Collection(Edm.String)', searchable: false, filterable: true, sortable: false, facetable: false, retrievable: true },
+    { name: 'search_text', type: 'Edm.String', searchable: true, filterable: false, sortable: false, facetable: false, retrievable: true }
 ];
 
 const RETRIEVABLE_EXTENDED_FIELDS = EXTENDED_INDEX_FIELDS.map(field => field.name);
@@ -112,27 +142,64 @@ function buildSearchDocument({ chunk, contentVector, metadata = {} }) {
 
     const fileName = blankToNull(metadata.fileName) || blankToNull(chunk.source);
     const authorityRank = normalizeAuthorityRank(metadata.authorityRank);
+    const meta = chunk.metadata || {};
+
+    const docId = blankToNull(chunk.document_id) || blankToNull(meta.document_id) || blankToNull(metadata.documentId) || blankToNull(chunk.documentId);
+    const chunkIdx = Number.isInteger(Number(chunk.chunk_index)) ? Number(chunk.chunk_index) :
+                     (Number.isInteger(Number(chunk.chunkIndex)) ? Number(chunk.chunkIndex) : null);
 
     return {
+        // Core fields (unchanged)
         id: chunk.id,
         title: blankToNull(chunk.title) || fileName || 'Document',
         content: String(chunk.content).trim(),
         source: blankToNull(chunk.source) || fileName || '',
         contentVector,
-        chunkIndex: Number.isInteger(Number(chunk.chunkIndex)) ? Number(chunk.chunkIndex) : null,
-        documentId: blankToNull(metadata.documentId) || blankToNull(chunk.documentId),
+
+        // Legacy extended fields
+        chunkIndex: chunkIdx,
+        documentId: docId,
         documentVersionId: blankToNull(metadata.documentVersionId),
         documentKey: blankToNull(metadata.documentKey),
         queueKey: blankToNull(metadata.queueKey),
         fileName,
         fileLink: blankToNull(metadata.fileLink),
-        heading: blankToNull(chunk.heading) || blankToNull(chunk.sectionTitle),
-        pageNumber: normalizePageNumber(chunk.pageNumber),
+        heading: blankToNull(chunk.heading) || blankToNull(chunk.sectionTitle) || blankToNull(meta.section_title),
+        pageNumber: normalizePageNumber(chunk.pageNumber) || normalizePageNumber(meta.page_start),
         department: blankToNull(metadata.department),
         jobTitle: blankToNull(metadata.jobTitle),
         authorityRank,
         authoritySource: authorityRank == null ? null : (blankToNull(metadata.authoritySource) || 'DocumentRank'),
-        modifiedDate: normalizeModifiedDate(metadata.modifiedDate)
+        modifiedDate: normalizeModifiedDate(metadata.modifiedDate),
+
+        // FinChat extended fields
+        document_id: docId,
+        document_family_id: blankToNull(chunk.document_family_id) || blankToNull(meta.document_family_id),
+        chunk_type: blankToNull(chunk.chunk_type) || blankToNull(meta.chunk_type),
+        entity: blankToNull(meta.entity),
+        document_type: blankToNull(meta.document_type),
+        period_label: blankToNull(meta.period_label),
+        basis: blankToNull(meta.basis),
+        status: blankToNull(meta.status),
+        currency: blankToNull(meta.currency),
+        language: blankToNull(meta.language) || blankToNull(chunk.language),
+        section_title: blankToNull(meta.section_title) || blankToNull(chunk.heading) || blankToNull(chunk.sectionTitle),
+        table_id: blankToNull(meta.table_id),
+        supersedes: blankToNull(meta.supersedes),
+        superseded_by: blankToNull(meta.superseded_by),
+        chunk_index: chunkIdx,
+        version: Number.isInteger(Number(meta.version)) ? Number(meta.version) : null,
+        page_start: Number.isInteger(Number(meta.page_start)) ? Number(meta.page_start) : normalizePageNumber(chunk.pageNumber),
+        page_end: Number.isInteger(Number(meta.page_end)) ? Number(meta.page_end) : normalizePageNumber(chunk.pageNumber),
+        table_part: Number.isInteger(Number(meta.table_part)) ? Number(meta.table_part) : null,
+        table_parts: Number.isInteger(Number(meta.table_parts)) ? Number(meta.table_parts) : null,
+        chunk_count: Number.isInteger(Number(meta.chunk_count)) ? Number(meta.chunk_count) : null,
+        audited: typeof meta.audited === 'boolean' ? meta.audited : null,
+        is_latest: typeof meta.is_latest === 'boolean' ? meta.is_latest : null,
+        period_end: normalizeModifiedDate(meta.period_end),
+        prepared_date: normalizeModifiedDate(meta.prepared_date),
+        access_tags: Array.isArray(meta.access_tags) ? meta.access_tags : (Array.isArray(chunk.access_tags) ? chunk.access_tags : []),
+        search_text: blankToNull(chunk.search_text)
     };
 }
 

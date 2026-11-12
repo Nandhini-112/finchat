@@ -6,7 +6,8 @@
   "scripts": {
     "start": "func start",
     "test": "node -e \"const fs=require('fs'),p=require('path');function walk(d){let res=[];for(let f of fs.readdirSync(d)){let fp=p.join(d,f);if(fs.statSync(fp).isDirectory())res.push(...walk(fp));else if(f.endsWith('.js'))res.push(fp);}return res;}walk('src').forEach(f=>{require('child_process').execSync('node --check '+f,{stdio:'inherit'});console.log('[PASS]',f);});console.log('All files passed syntax and build verification.');\"",
-    "test:unit": "node --test tests",
+    "test:unit": "node --test tests/*.test.js",
+    "demo:chunking": "node scripts/demo-chunking.js",
     "update-search-index": "node scripts/update-search-index.js"
   },
   "dependencies": {
