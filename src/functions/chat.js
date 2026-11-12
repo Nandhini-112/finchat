@@ -9,6 +9,7 @@ const { getFactsWithConflictContext } = require('../services/conflict-resolver')
 const { evaluateDeterministicCalculations, computePeriodComparison } = require('../services/calculation-engine');
 const { findRelevantStructuredFacts, formatSourceReferences } = require('../services/evidence-validation');
 const { generateAnswer } = require('../services/answer-generation');
+const { getActiveModelInfo } = require('../services/model-client');
 
 app.http('chat', {
     methods: ['POST'],
@@ -22,9 +23,7 @@ app.http('chat', {
         let stepStartTime = Date.now();
 
         try {
-            // =========================================================================
-            // STEP 0: REQUEST PARSING & DOCUMENT AUTHORIZATION
-            // =========================================================================
+            // STEP 0: Parse request, validate permissions, and resolve active LLM
             currentStep = 'STEP 0: REQUEST PARSING & VALIDATION';
             stepStartTime = Date.now();
             context.log(`[${correlationId}] [CHAT_STATUS: VALIDATING_INPUT] Parsing body and extracting authorization headers...`);
@@ -107,9 +106,7 @@ app.http('chat', {
                 searchFilter = `source eq '${targetDoc.FileName.replace(/'/g, "''")}'`;
             }
 
-            // =========================================================================
-            // STEP 1: MULTI-MODEL INTENT CLASSIFICATION & ROUTING
-            // =========================================================================
+            // STEP 1: Intent classification and routing (LLM with rule fallback)
             currentStep = 'STEP 1: INTENT CLASSIFICATION';
             stepStartTime = Date.now();
             context.log(`[${correlationId}] === ${currentStep} ===`);
@@ -131,17 +128,17 @@ app.http('chat', {
             let relevantFacts = [];
             let calculations = [];
             let insufficientEvidence = false;
+            let totalInputTokens = intent?.usage?.inputTokens || 0;
+            let totalOutputTokens = intent?.usage?.outputTokens || 0;
 
-            // =========================================================================
-            // FLOW A: DIRECT SQL (FINANCIAL FACTS & COMPARISONS)
-            // =========================================================================
+            // FLOW A: Query SQL facts, compute deterministic math, and generate answer
             if (routeUsed === 'DIRECT_SQL') {
                 currentStep = 'FLOW A: DIRECT SQL RETRIEVAL & CALCULATIONS';
                 stepStartTime = Date.now();
                 context.log(`[${correlationId}] === ${currentStep} ===`);
                 context.log(`[${correlationId}] [CHAT_STATUS: SQL_RETRIEVAL_START] Querying structured facts with conflict context from dbo.FinancialFacts...`);
 
-                // 1. Fetch structured facts with governance/conflict status
+                // 1. Fetch structured facts from database with conflict context
                 const allFacts = await getFactsWithConflictContext(targetDoc ? targetDoc.DocumentId : null);
                 context.log(`[${correlationId}] [CHAT_STATUS: SQL_FACTS_FETCHED] Retrieved ${allFacts.length} total candidate fact(s) from SQL in ${Date.now() - stepStartTime}ms.`);
 
@@ -157,7 +154,7 @@ app.http('chat', {
                     }
                 }
 
-                // 2. If comparison between dates/periods requested, compute period variance deterministically
+                // 2. Compute period comparisons deterministically (e.g., Q1 vs Q2)
                 if (intent.isComparison && intent.periods && intent.periods.length >= 2) {
                     stepStartTime = Date.now();
                     const periodDiffs = computePeriodComparison(allFacts, intent.periods[0], intent.periods[1]);
@@ -175,24 +172,28 @@ app.http('chat', {
                     context.log(`[${correlationId}] [CHAT_STATUS: CALC_ARITHMETIC] Evaluated ${mathCalcs.length} deterministic calculation(s) in ${Date.now() - stepStartTime}ms.`);
                 }
 
-                // Check for conflict status
+                // Check if any retrieved facts have document conflicts
                 const conflictsPresent = relevantFacts.filter(f => f.hasConflict);
                 if (conflictsPresent.length > 0) {
                     context.log(`[${correlationId}] [CHAT_STATUS: CONFLICTS_FLAGGED] Active Conflicts Found: ${conflictsPresent.length} (Passing governance notes to LLM).`);
                 }
 
-                // 4. Synthesize Answer or Auto-Fallback
+                // 4. Synthesize final answer with LLM or fallback to Azure AI Search
                 if (relevantFacts.length > 0 || calculations.length > 0) {
                     currentStep = 'FLOW A: LLM SQL ANSWER SYNTHESIS';
                     stepStartTime = Date.now();
                     context.log(`[${correlationId}] === ${currentStep} ===`);
                     context.log(`[${correlationId}] [CHAT_STATUS: SYNTHESIS_START] Flow A: Synthesizing grounded answer with ${relevantFacts.length} fact(s) and ${calculations.length} calculation(s)...`);
 
-                    const llmResult = await generateAnswer(question, [], relevantFacts, calculations);
+                    const llmResult = await generateAnswer(question, [], relevantFacts, calculations, correlationId);
                     finalAnswer = llmResult.answer;
                     insufficientEvidence = llmResult.insufficientEvidence;
+                    if (llmResult.usage) {
+                        totalInputTokens += llmResult.usage.inputTokens || 0;
+                        totalOutputTokens += llmResult.usage.outputTokens || 0;
+                    }
 
-                    // Build source references from SQL facts
+                    // Format source file references
                     const uniqueFiles = [...new Set(relevantFacts.map(f => f.SourceFileName).filter(Boolean))];
                     formattedSources = uniqueFiles.map((file, idx) => ({
                         id: idx + 1,
@@ -207,9 +208,7 @@ app.http('chat', {
                 }
             }
 
-            // =========================================================================
-            // FLOW B: AZURE AI SEARCH (SEMANTIC & NARRATIVE)
-            // =========================================================================
+            // FLOW B: Search document text via Azure AI Search (semantic search)
             if (routeUsed === 'AZURE_SEARCH') {
                 currentStep = 'FLOW B: AZURE AI SEARCH';
                 stepStartTime = Date.now();
@@ -230,18 +229,22 @@ app.http('chat', {
                 });
                 context.log(`[${correlationId}] [CHAT_STATUS: SEARCH_COMPLETE] Step 2B: Retrieved ${chunks.length} matching search chunk(s) in ${Date.now() - stepStartTime}ms.`);
 
-                // 3. Format sources
+                // 3. Format source citations
                 formattedSources = formatSourceReferences(chunks);
 
-                // 4. Synthesize Answer
+                // 4. Synthesize final answer using active LLM
                 currentStep = 'FLOW B: LLM SEARCH ANSWER SYNTHESIS';
                 stepStartTime = Date.now();
                 context.log(`[${correlationId}] === ${currentStep} ===`);
                 context.log(`[${correlationId}] [CHAT_STATUS: SYNTHESIS_START] Flow B: Synthesizing answer with ${chunks.length} retrieval chunk(s)...`);
 
-                const llmResult = await generateAnswer(question, chunks, [], []);
+                const llmResult = await generateAnswer(question, chunks, [], [], correlationId);
                 finalAnswer = llmResult.answer;
                 insufficientEvidence = llmResult.insufficientEvidence;
+                if (llmResult.usage) {
+                    totalInputTokens += llmResult.usage.inputTokens || 0;
+                    totalOutputTokens += llmResult.usage.outputTokens || 0;
+                }
 
                 context.log(`[${correlationId}] [CHAT_STATUS: SYNTHESIS_COMPLETE] Flow B Completed: Synthesized answer (${finalAnswer.length} chars, InsufficientEvidence=${insufficientEvidence}) in ${Date.now() - stepStartTime}ms.`);
             }

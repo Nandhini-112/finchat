@@ -1,26 +1,5 @@
 require('../utils/config');
-const OpenAI = require('openai').default;
-
-let llmClient = null;
-
-function getLLMClient() {
-    if (!llmClient) {
-        const apiKey = process.env.GROQ_API_KEY || process.env.AZURE_OPENAI_API_KEY;
-        const baseURL = process.env.GROQ_BASE_URL || (process.env.AZURE_OPENAI_ENDPOINT ? `${process.env.AZURE_OPENAI_ENDPOINT.replace(/\/+$/, '')}/openai/v1` : undefined);
-
-        if (!apiKey) {
-            return null;
-        }
-
-        llmClient = new OpenAI({
-            apiKey,
-            baseURL,
-            maxRetries: 2,
-            timeout: 10000 // Fast 10-second timeout for intent classification
-        });
-    }
-    return llmClient;
-}
+const { chatCompletion } = require('./model-client');
 
 const CLASSIFIER_SYSTEM_PROMPT = `You are a financial query intent classifier and router for Finora AI.
 Analyze the user's financial question and classify it into one of two routing paths:
@@ -45,21 +24,27 @@ You must respond ONLY with a raw JSON object (no markdown, no backticks, no prea
 }`;
 
 /**
- * Fast regex-based fallback if LLM classification fails or is unavailable.
+ * Rule-based classifier used as an instant fallback when LLM is unavailable.
+ * Routes numerical/comparison questions to DIRECT_SQL and narrative/policy questions to AZURE_SEARCH.
  */
 function classifyIntentByRules(question) {
     const q = (question || '').toLowerCase();
 
-    // Check for comparison keywords (English & Arabic)
+    // Check for policy, guideline, or handbook keywords (English & Arabic)
+    const isQualitative = /(policy|policies|guideline|guidelines|procedure|procedures|handbook|overview|terms|eligibility|rules|regulation|regulations|instructions|process|overview|شروط|سياسة|سياسات|دليل|إجراءات)/i.test(q);
+
+    // Check for period-over-period comparison keywords (English & Arabic)
     const isComparison = /(compare|comparison|versus|\bvs\b|difference|variance|growth|increase|decrease|change\s+between|مقارنة|قارن|الفرق|التباين|النمو|الزيادة|النقص)/i.test(q);
 
     // Check for financial & HR metric keywords (English & Arabic)
-    const isFinancialMetric = /(revenue|expense|salaries|salary|rent|profit|income|invoice|invoices|amount|count|balance|paid|unpaid|pending|ebitda|tax|taxes|turnover|cost|costs|fees|cash\s*flow|total|approved|declined|إيرادات|ايرادات|مصروفات|مصاريف|الرواتب|أجور|اجور|الربح|الأرباح|ارباح|الدخل|المبيعات|عدد\s+الموظفين|الموظفين|الضريبة|التكلفة|تكلفة)/i.test(q);
+    const isFinancialMetric = !isQualitative && (
+        /(revenue|salaries|salary|rent|profit|income|invoice|invoices|amount|count|balance|paid|unpaid|pending|ebitda|tax|taxes|turnover|cost|costs|fees|expense|expenses|cash\s*flow|total|approved|declined|إيرادات|ايرادات|مصروفات|مصاريف|الرواتب|أجور|اجور|الربح|الأرباح|ارباح|الدخل|المبيعات|عدد\s+الموظفين|الموظفين|الضريبة|التكلفة|تكلفة)/i.test(q)
+    );
 
-    // Extract potential period or date mentions (English & Arabic e.g. October 2026, Q1, الربع الثالث, ٢٠٢٤)
+    // Extract dates or fiscal periods (e.g. October 2026, Q1, FY24, ٢٠٢٤)
     const periodMatches = question.match(/(?:(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4}|q[1-4](?:\s+\d{4})?|fy\s*\d{2,4}|\d{4}|الربع\s+(?:الأول|الثاني|الثالث|الرابع)|٢٠\d{2})/gi) || [];
 
-    if (isFinancialMetric || isComparison) {
+    if ((isFinancialMetric || isComparison) && !isQualitative) {
         return {
             route: 'DIRECT_SQL',
             intentType: isComparison ? 'PERIOD_COMPARISON' : 'SINGLE_PERIOD_FACT',
@@ -83,29 +68,26 @@ function classifyIntentByRules(question) {
 }
 
 /**
- * Classify user intent using LLM with deterministic rule fallback.
+ * Classifies user intent using the active LLM (Azure or Groq).
+ * Falls back to rule-based routing if the LLM is unreachable.
  */
-async function classifyIntent(question) {
-    const client = getLLMClient();
-    const model = process.env.GROQ_MODEL || process.env.AZURE_OPENAI_CHAT_DEPLOYMENT || (process.env.GROQ_API_KEY ? 'llama-3.3-70b-versatile' : 'gpt-4o-mini');
-
-    if (!client) {
-        return classifyIntentByRules(question);
-    }
+async function classifyIntent(question, options = {}) {
+    const jobId = typeof options === 'string' ? options : (options?.jobId || options?.correlationId || null);
 
     try {
-        const response = await client.chat.completions.create({
-            model,
+        const response = await chatCompletion({
             messages: [
                 { role: 'system', content: CLASSIFIER_SYSTEM_PROMPT },
                 { role: 'user', content: `Question: "${question}"` }
             ],
             temperature: 0.0,
-            max_tokens: 300,
-            response_format: { type: 'json_object' }
+            maxTokens: 300,
+            responseFormat: { type: 'json_object' },
+            timeoutMs: 10000, // Fast 10-second timeout for intent classification
+            jobId
         });
 
-        const rawContent = response.choices?.[0]?.message?.content?.trim();
+        const rawContent = (response.text || '').trim();
         if (rawContent) {
             const parsed = JSON.parse(rawContent);
             if (parsed.route && (parsed.route === 'DIRECT_SQL' || parsed.route === 'AZURE_SEARCH')) {
@@ -116,12 +98,15 @@ async function classifyIntent(question) {
                     periods: Array.isArray(parsed.periods) ? parsed.periods : [],
                     isComparison: Boolean(parsed.isComparison),
                     confidence: Number(parsed.confidence) || 0.95,
-                    reasoning: parsed.reasoning || 'Classified by LLM'
+                    reasoning: parsed.reasoning || `Classified by LLM (${response.provider})`,
+                    provider: response.provider,
+                    model: response.model,
+                    usage: response.usage || { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
                 };
             }
         }
     } catch (err) {
-        console.warn('[IntentClassifier] LLM intent classification failed, falling back to rule engine:', err.message);
+        console.warn(`[IntentClassifier]${jobId ? ` [Job: ${jobId}]` : ''} LLM intent classification failed, falling back to rule engine:`, err.message);
     }
 
     return classifyIntentByRules(question);
