@@ -14,30 +14,41 @@ app.http('chat', {
     methods: ['POST'],
     authLevel: 'anonymous',
     handler: async (request, context) => {
+        const reqStartTime = Date.now();
         const correlationId = `chat-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-        context.log(`[${correlationId}] >>> START CHAT REQUEST <<< URL=${request.url}`);
+        context.log(`[${correlationId}] [CHAT_STATUS: RECEIVED] >>> START CHAT REQUEST <<< URL=${request.url}`);
 
         let currentStep = 'INITIALIZATION';
+        let stepStartTime = Date.now();
 
         try {
             // =========================================================================
             // STEP 0: REQUEST PARSING & DOCUMENT AUTHORIZATION
             // =========================================================================
             currentStep = 'STEP 0: REQUEST PARSING & VALIDATION';
+            stepStartTime = Date.now();
+            context.log(`[${correlationId}] [CHAT_STATUS: VALIDATING_INPUT] Parsing body and extracting authorization headers...`);
+
             const body = await request.json().catch(() => null);
             const { question, documentId } = validateChatRequest(body);
             const userGroupsHeader = request.headers.get('x-user-groups') || (body && body.userGroups) || null;
 
-            context.log(`[${correlationId}] Step 0 Output: Question="${question}", TargetDocument=${documentId || 'ALL'}, UserGroups=${userGroupsHeader || 'Public'}`);
+            context.log(`[${correlationId}] [CHAT_STATUS: INPUT_VALIDATED] Question="${question}", TargetDocument=${documentId || 'ALL'}, UserGroups=${userGroupsHeader || 'Public'} (${Date.now() - stepStartTime}ms)`);
 
             let targetDoc = null;
             let searchFilter = null;
 
             if (documentId) {
+                stepStartTime = Date.now();
+                context.log(`[${correlationId}] [CHAT_STATUS: DOC_LOOKUP] Querying dbo.Documents for identifier="${documentId}"...`);
                 targetDoc = await getDocumentById(documentId);
+
                 if (!targetDoc) {
+                    context.error(`[${correlationId}] [CHAT_STATUS: DOC_NOT_FOUND] Document with ID or name "${documentId}" was not found.`);
                     throw new NotFoundError(`Document with ID or name "${documentId}" was not found.`);
                 }
+
+                context.log(`[${correlationId}] [CHAT_STATUS: DOC_RESOLVED] Found DocumentId=${targetDoc.DocumentId}, FileName="${targetDoc.FileName}", Status="${targetDoc.IngestionStatus}", AuthorityRank=${targetDoc.AuthorityRank} (${Date.now() - stepStartTime}ms)`);
 
                 // Check document-level access permissions if configured
                 if (targetDoc.AllowedUserGroups && userGroupsHeader) {
@@ -45,6 +56,7 @@ app.http('chat', {
                     const userGroups = userGroupsHeader.split(',').map(g => g.trim().toLowerCase());
                     const hasAccess = userGroups.some(ug => allowed.includes(ug)) || allowed.includes('*');
                     if (!hasAccess) {
+                        context.warn(`[${correlationId}] [CHAT_STATUS: AUTH_DENIED] Access denied: UserGroups="${userGroupsHeader}" not in AllowedUserGroups="${targetDoc.AllowedUserGroups}".`);
                         return {
                             status: 403,
                             headers: { 'Content-Type': 'application/json' },
@@ -57,9 +69,11 @@ app.http('chat', {
                             })
                         };
                     }
+                    context.log(`[${correlationId}] [CHAT_STATUS: AUTH_GRANTED] Access granted for DocumentId=${targetDoc.DocumentId}.`);
                 }
 
                 if (targetDoc.IngestionStatus === 'Processing') {
+                    context.warn(`[${correlationId}] [CHAT_STATUS: BLOCKED_PROCESSING] Document "${targetDoc.FileName}" (ID: ${targetDoc.DocumentId}) is currently being ingested (Status='Processing'). Returning 409.`);
                     return {
                         status: 409,
                         headers: { 'Content-Type': 'application/json' },
@@ -75,6 +89,7 @@ app.http('chat', {
                 }
 
                 if (targetDoc.IngestionStatus === 'Failed') {
+                    context.warn(`[${correlationId}] [CHAT_STATUS: BLOCKED_FAILED] Ingestion previously failed for document "${targetDoc.FileName}" (ID: ${targetDoc.DocumentId}). Returning 200 with notice.`);
                     return {
                         status: 200,
                         headers: { 'Content-Type': 'application/json' },
@@ -96,10 +111,12 @@ app.http('chat', {
             // STEP 1: MULTI-MODEL INTENT CLASSIFICATION & ROUTING
             // =========================================================================
             currentStep = 'STEP 1: INTENT CLASSIFICATION';
+            stepStartTime = Date.now();
             context.log(`[${correlationId}] === ${currentStep} ===`);
+            context.log(`[${correlationId}] [CHAT_STATUS: INTENT_CLASSIFYING] Classifying question intent and routing...`);
 
             const intent = await classifyIntent(question);
-            context.log(`[${correlationId}] Step 1 Output (Intent Routing):`);
+            context.log(`[${correlationId}] [CHAT_STATUS: INTENT_RESOLVED] Intent classified in ${Date.now() - stepStartTime}ms:`);
             context.log(`[${correlationId}]   - Selected Route: ${intent.route}`);
             context.log(`[${correlationId}]   - Intent Type: ${intent.intentType}`);
             context.log(`[${correlationId}]   - Is Comparison: ${intent.isComparison}`);
@@ -120,40 +137,56 @@ app.http('chat', {
             // =========================================================================
             if (routeUsed === 'DIRECT_SQL') {
                 currentStep = 'FLOW A: DIRECT SQL RETRIEVAL & CALCULATIONS';
+                stepStartTime = Date.now();
                 context.log(`[${correlationId}] === ${currentStep} ===`);
+                context.log(`[${correlationId}] [CHAT_STATUS: SQL_RETRIEVAL_START] Querying structured facts with conflict context from dbo.FinancialFacts...`);
 
                 // 1. Fetch structured facts with governance/conflict status
                 const allFacts = await getFactsWithConflictContext(targetDoc ? targetDoc.DocumentId : null);
-                relevantFacts = findRelevantStructuredFacts(question, allFacts);
+                context.log(`[${correlationId}] [CHAT_STATUS: SQL_FACTS_FETCHED] Retrieved ${allFacts.length} total candidate fact(s) from SQL in ${Date.now() - stepStartTime}ms.`);
 
-                context.log(`[${correlationId}] Step 2A Output: Retrieved ${relevantFacts.length} relevant structured fact(s) from SQL`);
+                stepStartTime = Date.now();
+                relevantFacts = findRelevantStructuredFacts(question, allFacts);
+                context.log(`[${correlationId}] [CHAT_STATUS: SQL_FACTS_MATCHED] Matched ${relevantFacts.length} relevant structured fact(s) in ${Date.now() - stepStartTime}ms.`);
+
+                if (relevantFacts.length > 0) {
+                    const sampleCount = Math.min(relevantFacts.length, 3);
+                    for (let i = 0; i < sampleCount; i++) {
+                        const f = relevantFacts[i];
+                        context.log(`  [Fact ${i + 1}] Metric="${f.Metric}", Canon="${f.CanonicalMetric || 'N/A'}", Period="${f.PeriodLabel}", Value=${f.NumericValue ?? f.TextValue} ${f.Currency || f.Unit || ''}, Source="${f.SourceFileName}"`);
+                    }
+                }
 
                 // 2. If comparison between dates/periods requested, compute period variance deterministically
                 if (intent.isComparison && intent.periods && intent.periods.length >= 2) {
+                    stepStartTime = Date.now();
                     const periodDiffs = computePeriodComparison(allFacts, intent.periods[0], intent.periods[1]);
                     if (periodDiffs.length > 0) {
                         calculations.push(...periodDiffs);
-                        context.log(`[${correlationId}]   - Computed ${periodDiffs.length} period-over-period comparison variance(s).`);
+                        context.log(`[${correlationId}] [CHAT_STATUS: CALC_PERIOD_COMPARISON] Computed ${periodDiffs.length} period comparison variance(s) [${intent.periods[0]} vs ${intent.periods[1]}] in ${Date.now() - stepStartTime}ms.`);
                     }
                 }
 
                 // 3. Evaluate additional deterministic arithmetic (variances, category sums, discrepancies)
+                stepStartTime = Date.now();
                 const mathCalcs = evaluateDeterministicCalculations(question, relevantFacts, intent);
                 if (mathCalcs.length > 0) {
                     calculations.push(...mathCalcs);
-                    context.log(`[${correlationId}]   - Evaluated ${mathCalcs.length} deterministic calculation(s).`);
+                    context.log(`[${correlationId}] [CHAT_STATUS: CALC_ARITHMETIC] Evaluated ${mathCalcs.length} deterministic calculation(s) in ${Date.now() - stepStartTime}ms.`);
                 }
 
                 // Check for conflict status
                 const conflictsPresent = relevantFacts.filter(f => f.hasConflict);
                 if (conflictsPresent.length > 0) {
-                    context.log(`[${correlationId}]   - Active Conflicts Found: ${conflictsPresent.length} (Passing governance notes to LLM)`);
+                    context.log(`[${correlationId}] [CHAT_STATUS: CONFLICTS_FLAGGED] Active Conflicts Found: ${conflictsPresent.length} (Passing governance notes to LLM).`);
                 }
 
                 // 4. Synthesize Answer or Auto-Fallback
                 if (relevantFacts.length > 0 || calculations.length > 0) {
                     currentStep = 'FLOW A: LLM SQL ANSWER SYNTHESIS';
+                    stepStartTime = Date.now();
                     context.log(`[${correlationId}] === ${currentStep} ===`);
+                    context.log(`[${correlationId}] [CHAT_STATUS: SYNTHESIS_START] Flow A: Synthesizing grounded answer with ${relevantFacts.length} fact(s) and ${calculations.length} calculation(s)...`);
 
                     const llmResult = await generateAnswer(question, [], relevantFacts, calculations);
                     finalAnswer = llmResult.answer;
@@ -167,9 +200,9 @@ app.http('chat', {
                         citation: `[${idx + 1}] ${file}`
                     }));
 
-                    context.log(`[${correlationId}] Flow A Completed: Synthesized answer (${finalAnswer.length} chars).`);
+                    context.log(`[${correlationId}] [CHAT_STATUS: SYNTHESIS_COMPLETE] Flow A Completed: Synthesized answer (${finalAnswer.length} chars, InsufficientEvidence=${insufficientEvidence}) in ${Date.now() - stepStartTime}ms.`);
                 } else {
-                    context.log(`[${correlationId}] Flow A Notice: 0 SQL facts matched. Seamlessly falling back to Flow B (Azure AI Search)...`);
+                    context.log(`[${correlationId}] [CHAT_STATUS: SQL_FALLBACK] Flow A Notice: 0 SQL facts matched. Seamlessly falling back to Flow B (Azure AI Search)...`);
                     routeUsed = 'AZURE_SEARCH';
                 }
             }
@@ -179,39 +212,45 @@ app.http('chat', {
             // =========================================================================
             if (routeUsed === 'AZURE_SEARCH') {
                 currentStep = 'FLOW B: AZURE AI SEARCH';
+                stepStartTime = Date.now();
                 context.log(`[${correlationId}] === ${currentStep} ===`);
 
                 // 1. Generate vector embedding
-                context.log(`[${correlationId}] Step 2B: Generating query embedding via text-embedding-3-small...`);
+                context.log(`[${correlationId}] [CHAT_STATUS: EMBEDDING_START] Step 2B: Generating query vector embedding via text-embedding-3-small...`);
                 const queryVector = await generateEmbedding(question);
+                context.log(`[${correlationId}] [CHAT_STATUS: EMBEDDING_COMPLETE] Step 2B: Generated ${queryVector.length}-dim vector embedding in ${Date.now() - stepStartTime}ms.`);
 
                 // 2. Search Azure AI Search
-                context.log(`[${correlationId}] Step 2B: Searching Azure AI Search index "finance-hr-documents"...`);
+                stepStartTime = Date.now();
+                context.log(`[${correlationId}] [CHAT_STATUS: SEARCH_START] Step 2B: Searching index "finance-hr-documents" with filter="${searchFilter || 'NONE'}"...`);
                 const chunks = await searchSimilar(queryVector, {
                     top: 4,
                     filter: searchFilter,
                     searchText: question
                 });
-                context.log(`[${correlationId}] Step 2B Output: Retrieved ${chunks.length} matching search chunk(s).`);
+                context.log(`[${correlationId}] [CHAT_STATUS: SEARCH_COMPLETE] Step 2B: Retrieved ${chunks.length} matching search chunk(s) in ${Date.now() - stepStartTime}ms.`);
 
                 // 3. Format sources
                 formattedSources = formatSourceReferences(chunks);
 
                 // 4. Synthesize Answer
                 currentStep = 'FLOW B: LLM SEARCH ANSWER SYNTHESIS';
+                stepStartTime = Date.now();
                 context.log(`[${correlationId}] === ${currentStep} ===`);
+                context.log(`[${correlationId}] [CHAT_STATUS: SYNTHESIS_START] Flow B: Synthesizing answer with ${chunks.length} retrieval chunk(s)...`);
 
                 const llmResult = await generateAnswer(question, chunks, [], []);
                 finalAnswer = llmResult.answer;
                 insufficientEvidence = llmResult.insufficientEvidence;
 
-                context.log(`[${correlationId}] Flow B Completed: Synthesized answer (${finalAnswer.length} chars).`);
+                context.log(`[${correlationId}] [CHAT_STATUS: SYNTHESIS_COMPLETE] Flow B Completed: Synthesized answer (${finalAnswer.length} chars, InsufficientEvidence=${insufficientEvidence}) in ${Date.now() - stepStartTime}ms.`);
             }
 
             // =========================================================================
             // RESPONSE ASSEMBLY
             // =========================================================================
-            context.log(`[${correlationId}] >>> CHAT REQUEST COMPLETED SUCCESSFULLY <<< Route=${routeUsed}, Sources=${formattedSources.length}`);
+            const totalElapsedMs = Date.now() - reqStartTime;
+            context.log(`[${correlationId}] [CHAT_STATUS: COMPLETED] >>> CHAT REQUEST COMPLETED SUCCESSFULLY <<< Route=${routeUsed}, Sources=${formattedSources.length}, FactsUsed=${relevantFacts.length}, Calculations=${calculations.length}, InsufficientEvidence=${insufficientEvidence}, TotalDuration=${totalElapsedMs}ms, HTTPStatus=200`);
 
             return {
                 status: 200,
@@ -239,12 +278,14 @@ app.http('chat', {
                     })),
                     calculations,
                     insufficientEvidence,
+                    durationMs: totalElapsedMs,
                     correlationId
                 })
             };
 
         } catch (error) {
-            context.error(`[${correlationId}] !!! CHAT FAILED AT [${currentStep}] !!!`);
+            const totalElapsedMs = Date.now() - reqStartTime;
+            context.error(`[${correlationId}] [CHAT_STATUS: FAILED] !!! CHAT FAILED AT [${currentStep}] !!! TotalDuration=${totalElapsedMs}ms`);
             context.error(`[${correlationId}] Error: ${error.message}`);
             if (error.stack) context.error(`[${correlationId}] Stack: ${error.stack}`);
             return toErrorResponse(error, correlationId);
