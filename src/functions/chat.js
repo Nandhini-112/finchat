@@ -1,14 +1,8 @@
 const { app } = require('@azure/functions');
 const { validateChatRequest } = require('../utils/validation');
 const { toErrorResponse, NotFoundError } = require('../utils/errors');
-const { classifyIntent } = require('../services/intent-classifier');
-const { generateEmbedding } = require('../services/embeddings');
-const { searchSimilar } = require('../services/azure-search');
 const { getDocumentById } = require('../services/sql');
-const { getFactsWithConflictContext } = require('../services/conflict-resolver');
-const { evaluateDeterministicCalculations, computePeriodComparison } = require('../services/calculation-engine');
-const { findRelevantStructuredFacts, formatSourceReferences } = require('../services/evidence-validation');
-const { generateAnswer } = require('../services/answer-generation');
+const { processRetrievalPipeline } = require('../services/retrieval-pipeline');
 
 app.http('chat', {
     methods: ['POST'],
@@ -93,153 +87,47 @@ app.http('chat', {
             }
 
             // =========================================================================
-            // STEP 1: MULTI-MODEL INTENT CLASSIFICATION & ROUTING
+            // EXECUTE COMPLETE 11-STAGE RETRIEVAL PIPELINE
             // =========================================================================
-            currentStep = 'STEP 1: INTENT CLASSIFICATION';
+            currentStep = 'EXECUTE RETRIEVAL PIPELINE (STAGES 1 - 11)';
             context.log(`[${correlationId}] === ${currentStep} ===`);
 
-            const intent = await classifyIntent(question);
-            context.log(`[${correlationId}] Step 1 Output (Intent Routing):`);
-            context.log(`[${correlationId}]   - Selected Route: ${intent.route}`);
-            context.log(`[${correlationId}]   - Intent Type: ${intent.intentType}`);
-            context.log(`[${correlationId}]   - Is Comparison: ${intent.isComparison}`);
-            context.log(`[${correlationId}]   - Target Periods/Dates: [${(intent.periods || []).join(', ')}]`);
-            context.log(`[${correlationId}]   - Target Metrics: [${(intent.metrics || []).join(', ')}]`);
-            context.log(`[${correlationId}]   - Routing Confidence: ${intent.confidence}`);
-            context.log(`[${correlationId}]   - Reasoning: ${intent.reasoning}`);
-
-            let routeUsed = intent.route;
-            let finalAnswer = '';
-            let formattedSources = [];
-            let relevantFacts = [];
-            let calculations = [];
-            let insufficientEvidence = false;
+            const pipelineResult = await processRetrievalPipeline({
+                question,
+                targetDocument: targetDoc,
+                searchFilter,
+                conversationHistory: (body && (body.conversationHistory || body.messages || body.history)) || null,
+                correlationId,
+                logger: context
+            });
 
             // =========================================================================
-            // FLOW A: DIRECT SQL (FINANCIAL FACTS & COMPARISONS)
+            // RESPONSE DELIVERY (PRESERVING EXACT API RESPONSE CONTRACT)
             // =========================================================================
-            if (routeUsed === 'DIRECT_SQL') {
-                currentStep = 'FLOW A: DIRECT SQL RETRIEVAL & CALCULATIONS';
-                context.log(`[${correlationId}] === ${currentStep} ===`);
-
-                // 1. Fetch structured facts with governance/conflict status
-                const allFacts = await getFactsWithConflictContext(targetDoc ? targetDoc.DocumentId : null);
-                relevantFacts = findRelevantStructuredFacts(question, allFacts);
-
-                context.log(`[${correlationId}] Step 2A Output: Retrieved ${relevantFacts.length} relevant structured fact(s) from SQL`);
-
-                // 2. If comparison between dates/periods requested, compute period variance deterministically
-                if (intent.isComparison && intent.periods && intent.periods.length >= 2) {
-                    const periodDiffs = computePeriodComparison(allFacts, intent.periods[0], intent.periods[1]);
-                    if (periodDiffs.length > 0) {
-                        calculations.push(...periodDiffs);
-                        context.log(`[${correlationId}]   - Computed ${periodDiffs.length} period-over-period comparison variance(s).`);
-                    }
-                }
-
-                // 3. Evaluate additional deterministic arithmetic (variances, category sums, discrepancies)
-                const mathCalcs = evaluateDeterministicCalculations(question, relevantFacts, intent);
-                if (mathCalcs.length > 0) {
-                    calculations.push(...mathCalcs);
-                    context.log(`[${correlationId}]   - Evaluated ${mathCalcs.length} deterministic calculation(s).`);
-                }
-
-                // Check for conflict status
-                const conflictsPresent = relevantFacts.filter(f => f.hasConflict);
-                if (conflictsPresent.length > 0) {
-                    context.log(`[${correlationId}]   - Active Conflicts Found: ${conflictsPresent.length} (Passing governance notes to LLM)`);
-                }
-
-                // 4. Synthesize Answer or Auto-Fallback
-                if (relevantFacts.length > 0 || calculations.length > 0) {
-                    currentStep = 'FLOW A: LLM SQL ANSWER SYNTHESIS';
-                    context.log(`[${correlationId}] === ${currentStep} ===`);
-
-                    const llmResult = await generateAnswer(question, [], relevantFacts, calculations);
-                    finalAnswer = llmResult.answer;
-                    insufficientEvidence = llmResult.insufficientEvidence;
-
-                    // Build source references from SQL facts
-                    const uniqueFiles = [...new Set(relevantFacts.map(f => f.SourceFileName).filter(Boolean))];
-                    formattedSources = uniqueFiles.map((file, idx) => ({
-                        id: idx + 1,
-                        source: file,
-                        citation: `[${idx + 1}] ${file}`
-                    }));
-
-                    context.log(`[${correlationId}] Flow A Completed: Synthesized answer (${finalAnswer.length} chars).`);
-                } else {
-                    context.log(`[${correlationId}] Flow A Notice: 0 SQL facts matched. Seamlessly falling back to Flow B (Azure AI Search)...`);
-                    routeUsed = 'AZURE_SEARCH';
-                }
-            }
-
-            // =========================================================================
-            // FLOW B: AZURE AI SEARCH (SEMANTIC & NARRATIVE)
-            // =========================================================================
-            if (routeUsed === 'AZURE_SEARCH') {
-                currentStep = 'FLOW B: AZURE AI SEARCH';
-                context.log(`[${correlationId}] === ${currentStep} ===`);
-
-                // 1. Generate vector embedding
-                context.log(`[${correlationId}] Step 2B: Generating query embedding via text-embedding-3-small...`);
-                const queryVector = await generateEmbedding(question);
-
-                // 2. Search Azure AI Search
-                context.log(`[${correlationId}] Step 2B: Searching Azure AI Search index "finance-hr-documents"...`);
-                const chunks = await searchSimilar(queryVector, {
-                    top: 4,
-                    filter: searchFilter,
-                    searchText: question
-                });
-                context.log(`[${correlationId}] Step 2B Output: Retrieved ${chunks.length} matching search chunk(s).`);
-
-                // 3. Format sources
-                formattedSources = formatSourceReferences(chunks);
-
-                // 4. Synthesize Answer
-                currentStep = 'FLOW B: LLM SEARCH ANSWER SYNTHESIS';
-                context.log(`[${correlationId}] === ${currentStep} ===`);
-
-                const llmResult = await generateAnswer(question, chunks, [], []);
-                finalAnswer = llmResult.answer;
-                insufficientEvidence = llmResult.insufficientEvidence;
-
-                context.log(`[${correlationId}] Flow B Completed: Synthesized answer (${finalAnswer.length} chars).`);
-            }
-
-            // =========================================================================
-            // RESPONSE ASSEMBLY
-            // =========================================================================
-            context.log(`[${correlationId}] >>> CHAT REQUEST COMPLETED SUCCESSFULLY <<< Route=${routeUsed}, Sources=${formattedSources.length}`);
+            context.log(`[${correlationId}] >>> CHAT REQUEST COMPLETED SUCCESSFULLY <<< Route=${pipelineResult.routeUsed}, Sources=${pipelineResult.sources.length}`);
 
             return {
                 status: 200,
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    routeUsed,
-                    intentType: intent.intentType,
-                    answer: finalAnswer,
-                    documentId: targetDoc ? targetDoc.DocumentId : (relevantFacts[0]?.DocumentId || null),
-                    sources: formattedSources,
-                    factsUsed: relevantFacts.map(f => ({
-                        metric: f.Metric,
-                        entity: f.Entity,
-                        period: f.PeriodLabel,
-                        value: f.NumericValue !== null ? f.NumericValue : f.TextValue,
-                        unit: f.Unit,
-                        currency: f.Currency,
-                        location: f.SourceLocation,
-                        sourceFile: f.SourceFileName,
-                        authorityRank: f.AuthorityRank,
-                        authorityType: f.AuthorityType,
-                        hasConflict: f.hasConflict || false,
-                        conflictStatus: f.conflictStatus || null,
-                        conflictExplanation: f.conflictExplanation || null
-                    })),
-                    calculations,
-                    insufficientEvidence,
-                    correlationId
+                    status: pipelineResult.status || 'success',
+                    routeUsed: pipelineResult.routeUsed,
+                    intentType: pipelineResult.intentType,
+                    entitiesDetected: pipelineResult.entitiesDetected || [],
+                    periodsDetected: pipelineResult.periodsDetected || [],
+                    metricsDetected: pipelineResult.metricsDetected || [],
+                    answer: pipelineResult.answer,
+                    language: pipelineResult.language,
+                    grounded: pipelineResult.grounded,
+                    hasUnresolvedConflict: pipelineResult.hasUnresolvedConflict,
+                    documentId: pipelineResult.documentId,
+                    document_name: pipelineResult.document_name,
+                    page: pipelineResult.page,
+                    sources: pipelineResult.sources || [],
+                    factsUsed: pipelineResult.factsUsed || [],
+                    calculations: pipelineResult.calculations || [],
+                    insufficientEvidence: pipelineResult.insufficientEvidence,
+                    correlationId: pipelineResult.correlationId
                 })
             };
 

@@ -37,12 +37,128 @@ You must respond ONLY with a raw JSON object (no markdown, no backticks, no prea
 {
   "route": "DIRECT_SQL" | "AZURE_SEARCH",
   "intentType": "SINGLE_PERIOD_FACT" | "PERIOD_COMPARISON" | "GENERAL_SEARCH",
-  "metrics": ["list", "of", "metrics"],
-  "periods": ["list", "of", "periods_or_dates"],
+  "metrics": ["exact metric names detected in the question, e.g. net profit, gross profit, revenue, operating expenses"],
+  "periods": ["list_of_periods_or_dates"],
+  "entities": ["list of company/entity/organization names explicitly mentioned in the question, e.g. Contoso Retail, Contoso Properties LLC. Empty array if none mentioned."],
   "isComparison": true | false,
   "confidence": 0.0 to 1.0,
   "reasoning": "brief explanation"
 }`;
+
+// Ordered from most-specific to least-specific so longer phrases match first
+const KNOWN_METRIC_PATTERNS = [
+    'net profit for the period',
+    'net profit',
+    'gross profit',
+    'operating profit',
+    'profit before tax',
+    'profit after tax',
+    'total revenue',
+    'operating revenue',
+    'other income',
+    'operating expenses',
+    'total expenses',
+    'general and administrative',
+    'selling expenses',
+    'finance costs',
+    'finance income',
+    'depreciation and amortization',
+    'depreciation',
+    'amortization',
+    'ebitda',
+    'ebit',
+    'operating income',
+    'net income',
+    'income tax',
+    'tax expense',
+    'revenue',
+    'sales',
+    'turnover',
+    'expenses',
+    'expense',
+    'cost of goods sold',
+    'cost of sales',
+    'costs',
+    'cost',
+    'salaries',
+    'salary',
+    'payroll',
+    'wages',
+    'compensation',
+    'headcount',
+    'employee count',
+    'employees',
+    'attrition',
+    'cash and bank',
+    'bank balance',
+    'cash balance',
+    'cash flow',
+    'cash',
+    'accounts receivable',
+    'receivables',
+    'accounts payable',
+    'payables',
+    'inventory',
+    'total assets',
+    'total liabilities',
+    'total equity',
+    'assets',
+    'liabilities',
+    'equity',
+    'profit',
+    'income',
+    'tax',
+    'taxes',
+    'rent',
+    'office rent',
+    'invoices',
+    'invoice'
+];
+
+/**
+ * Extract metric names from a question using an ordered regex list.
+ * Returns an array of distinct matched metric strings (longest match wins).
+ */
+function extractMetricsFromQuestion(question) {
+    const q = (question || '').toLowerCase();
+    const matched = new Set();
+
+    // Try each pattern in order (most-specific first)
+    for (const pattern of KNOWN_METRIC_PATTERNS) {
+        // Use word-boundary-like check: pattern preceded/followed by non-word chars
+        const regex = new RegExp(`(?<![a-z])${pattern.replace(/\s+/g, '\\s+')}(?![a-z])`, 'i');
+        if (regex.test(q)) {
+            // Only add if no already-matched pattern already contains this one
+            const dominated = [...matched].some(m => m.includes(pattern) || pattern.includes(m) && m.length > pattern.length);
+            if (!dominated) {
+                matched.add(pattern);
+            }
+        }
+    }
+
+    return [...matched];
+}
+
+/**
+ * Extract entity names from a question using regex heuristics.
+ * Looks for "Contoso *", "Acme *", or any capitalized multi-word proper noun phrases.
+ * This is used as a fallback / supplement when the LLM doesn't return entities.
+ */
+function extractEntitiesFromQuestion(question) {
+    const entities = new Set();
+
+    // Match well-known Contoso-style brand names (Contoso + optional word + optional LLC/Ltd/Inc/Corp)
+    const contosoPattern = /Contoso\s+\w+(?:\s+(?:LLC|Ltd|Inc|Corp|Group|Holdings|Retail|Properties|Logistics|Finance|Services|Solutions))?/gi;
+    const contosoMatches = question.match(contosoPattern) || [];
+    contosoMatches.forEach(m => entities.add(m.trim()));
+
+    // Match generic "Company Name LLC / Ltd / Inc / Corp / Holdings / Group" patterns
+    const corpPattern = /\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,3}\s+(?:LLC|Ltd|Inc|Corp|Holdings|Group|Properties|Retail|Logistics)\b/g;
+    const corpMatches = question.match(corpPattern) || [];
+    corpMatches.forEach(m => entities.add(m.trim()));
+
+    return [...entities];
+}
 
 /**
  * Fast regex-based fallback if LLM classification fails or is unavailable.
@@ -59,12 +175,18 @@ function classifyIntentByRules(question) {
     // Extract potential period or date mentions (English & Arabic e.g. October 2026, Q1, الربع الثالث, ٢٠٢٤)
     const periodMatches = question.match(/(?:(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4}|q[1-4](?:\s+\d{4})?|fy\s*\d{2,4}|\d{4}|الربع\s+(?:الأول|الثاني|الثالث|الرابع)|٢٠\d{2})/gi) || [];
 
+    const entities = extractEntitiesFromQuestion(question);
+
+    // Extract metrics from query text
+    const metrics = extractMetricsFromQuestion(question);
+
     if (isFinancialMetric || isComparison) {
         return {
             route: 'DIRECT_SQL',
             intentType: isComparison ? 'PERIOD_COMPARISON' : 'SINGLE_PERIOD_FACT',
-            metrics: [],
+            metrics,
             periods: periodMatches.map(p => p.trim()),
+            entities,
             isComparison,
             confidence: 0.85,
             reasoning: 'Rule-based match on financial metric / comparison keywords'
@@ -74,8 +196,9 @@ function classifyIntentByRules(question) {
     return {
         route: 'AZURE_SEARCH',
         intentType: 'GENERAL_SEARCH',
-        metrics: [],
+        metrics,
         periods: periodMatches.map(p => p.trim()),
+        entities,
         isComparison: false,
         confidence: 0.80,
         reasoning: 'Rule-based fallback to semantic search'
@@ -109,11 +232,22 @@ async function classifyIntent(question) {
         if (rawContent) {
             const parsed = JSON.parse(rawContent);
             if (parsed.route && (parsed.route === 'DIRECT_SQL' || parsed.route === 'AZURE_SEARCH')) {
+                // Merge LLM entities with regex-extracted entities for reliability
+                const llmEntities = Array.isArray(parsed.entities) ? parsed.entities : [];
+                const regexEntities = extractEntitiesFromQuestion(question);
+                const mergedEntities = [...new Set([...llmEntities, ...regexEntities])];
+
+                // Merge LLM metrics with regex-extracted metrics for reliability
+                const llmMetrics = Array.isArray(parsed.metrics) ? parsed.metrics.map(m => m.toLowerCase().trim()) : [];
+                const regexMetrics = extractMetricsFromQuestion(question);
+                const mergedMetrics = [...new Set([...llmMetrics, ...regexMetrics])];
+
                 return {
                     route: parsed.route,
                     intentType: parsed.intentType || (parsed.isComparison ? 'PERIOD_COMPARISON' : 'SINGLE_PERIOD_FACT'),
-                    metrics: Array.isArray(parsed.metrics) ? parsed.metrics : [],
+                    metrics: mergedMetrics,
                     periods: Array.isArray(parsed.periods) ? parsed.periods : [],
+                    entities: mergedEntities,
                     isComparison: Boolean(parsed.isComparison),
                     confidence: Number(parsed.confidence) || 0.95,
                     reasoning: parsed.reasoning || 'Classified by LLM'
@@ -129,5 +263,8 @@ async function classifyIntent(question) {
 
 module.exports = {
     classifyIntent,
-    classifyIntentByRules
+    classifyIntentByRules,
+    extractEntitiesFromQuestion,
+    extractMetricsFromQuestion,
+    KNOWN_METRIC_PATTERNS
 };
