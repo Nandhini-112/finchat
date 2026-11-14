@@ -1,10 +1,11 @@
 node_modules
 .azurite
+__azurite*
+__blobstorage__
+AzuriteConfig
 .env
 local.settings.json
 *.log
-
-
 
 #test
 test-acceptance-suite.js

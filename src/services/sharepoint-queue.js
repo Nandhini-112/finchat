@@ -615,6 +615,7 @@ async function getAllPages(graphClient, request) {
 
 /**
  * Read a SharePoint field safely.
+ * Handles space encodings like '_x0020_' and case-insensitive matching.
  */
 function getField(fields, name) {
     if (!fields) {
@@ -628,9 +629,12 @@ function getField(fields, name) {
         return fields[name];
     }
 
-    const matchedKey = Object.keys(fields).find(
-        key => key.toLowerCase() === name.toLowerCase()
-    );
+    const cleanTarget = String(name).toLowerCase().replace(/[^a-z0-9]/g, '');
+
+    const matchedKey = Object.keys(fields).find(key => {
+        const cleanKey = String(key).toLowerCase().replace(/_x0020_/g, '').replace(/[^a-z0-9]/g, '');
+        return cleanKey === cleanTarget || key.toLowerCase() === name.toLowerCase();
+    });
 
     return matchedKey &&
         fields[matchedKey] !== undefined &&
@@ -711,10 +715,24 @@ async function getPendingQueueItems(
 
                 CreatedByJobTitle: getField(fields, 'CreatedByJobTitle'),
 
-                ProcessingStatus: getField(
-                    fields,
-                    'ProcessingStatus'
-                ),
+                ModifiedByEmail: getField(fields, 'ModifiedByEmail') ||
+                    getField(fields, 'EditorEmail') ||
+                    getField(fields, 'UserEmail') ||
+                    item.lastModifiedBy?.user?.email ||
+                    item.createdBy?.user?.email ||
+                    null,
+
+                ModifiedByName: getField(fields, 'ModifiedByName') ||
+                    getField(fields, 'Editor') ||
+                    item.lastModifiedBy?.user?.displayName ||
+                    item.createdBy?.user?.displayName ||
+                    null,
+
+                ProcessingStatus: getField(fields, 'ProcessingStatus') ||
+                    getField(fields, 'Processing_x0020_Status') ||
+                    getField(fields, 'Status') ||
+                    getField(fields, 'QueueStatus') ||
+                    '',
 
                 AuthorityRank:
                     Number(
@@ -726,11 +744,11 @@ async function getPendingQueueItems(
                     null
             };
         })
-        .filter(item =>
-            String(item.ProcessingStatus)
-                .trim()
-                .toLowerCase() === 'pending'
-        );
+        .filter(item => {
+            const status = String(item.ProcessingStatus || '').trim().toLowerCase();
+            // Match 'pending', 'new', or if newly uploaded without an assigned status yet (empty string)
+            return status === 'pending' || status === 'new' || status === '';
+        });
 
     // If list is a Document Library and DriveItemId was not provided as a custom column,
     // resolve driveItem.id from Graph API for each pending item.
@@ -815,7 +833,8 @@ async function updateQueueItemStatus(
     listId,
     listItemId,
     status,
-    errorSummary = ''
+    errorSummary = '',
+    conflictDetected = null
 ) {
     if (!status) {
         throw new Error('ProcessingStatus is required.');
@@ -830,6 +849,12 @@ async function updateQueueItemStatus(
             ProcessingStatus: status
         };
 
+        if (status === 'Pending Review' || conflictDetected === true) {
+            patchPayload.ConflictDetected = true;
+        } else if (status === 'Processed' || conflictDetected === false) {
+            patchPayload.ConflictDetected = false;
+        }
+
         if (status === 'Failed' || errorSummary) {
             patchPayload.ErrorSummary = errorSummary ? String(errorSummary).slice(0, 500) : '';
         } else if (status === 'Processed' || status === 'Processing') {
@@ -839,13 +864,19 @@ async function updateQueueItemStatus(
         try {
             await graphClient.api(endpoint).patch(patchPayload);
         } catch (patchErr) {
-            // Graceful fallback: If SharePoint list does not have an ErrorSummary column created yet,
-            // retry patching just ProcessingStatus so locking/status transitions never fail.
-            const errMsg = String(patchErr.message || '').toLowerCase();
-            if (patchPayload.ErrorSummary !== undefined && (errMsg.includes('errorsummary') || errMsg.includes('field') || errMsg.includes('property') || errMsg.includes('does not exist'))) {
-                await graphClient.api(endpoint).patch({ ProcessingStatus: status });
-            } else {
-                throw patchErr;
+            // Graceful fallback: If SharePoint list does not have ConflictDetected or ErrorSummary column created yet,
+            // progressively simplify the payload so locking/status transitions never fail.
+            try {
+                delete patchPayload.ConflictDetected;
+                delete patchPayload.ConflictDetails;
+                await graphClient.api(endpoint).patch(patchPayload);
+            } catch (fallbackErr) {
+                const errMsg = String(fallbackErr.message || '').toLowerCase();
+                if (errMsg.includes('errorsummary') || errMsg.includes('field') || errMsg.includes('property') || errMsg.includes('does not exist')) {
+                    await graphClient.api(endpoint).patch({ ProcessingStatus: status });
+                } else {
+                    throw fallbackErr;
+                }
             }
         }
 

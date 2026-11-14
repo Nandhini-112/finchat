@@ -123,6 +123,36 @@ async function ensureDatabaseSchema(p) {
                     CreatedAt DATETIME2 NULL DEFAULT SYSUTCDATETIME()
                 );
             END;
+
+            -- 7. Audit Logs Table (Tamper-evident governance trail)
+            IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'AuditLogs')
+            BEGIN
+                CREATE TABLE dbo.AuditLogs (
+                    AuditId BIGINT IDENTITY(1,1) PRIMARY KEY,
+                    EventType NVARCHAR(50) NOT NULL,
+                    DocumentId BIGINT NULL,
+                    ConflictId BIGINT NULL,
+                    ActionBy NVARCHAR(255) NULL,
+                    ActionRole NVARCHAR(50) NULL,
+                    PreviousStatus NVARCHAR(50) NULL,
+                    NewStatus NVARCHAR(50) NULL,
+                    Details NVARCHAR(MAX) NULL,
+                    CorrelationId NVARCHAR(100) NULL,
+                    Timestamp DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+                );
+                CREATE INDEX IX_AuditLogs_DocumentId ON dbo.AuditLogs(DocumentId);
+                CREATE INDEX IX_AuditLogs_EventType ON dbo.AuditLogs(EventType);
+            END;
+
+            -- Ensure FactConflicts extension columns
+            IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('dbo.FactConflicts') AND name = 'ResolutionToken')
+            BEGIN
+                ALTER TABLE dbo.FactConflicts ADD 
+                    ResolutionToken NVARCHAR(255) NULL,
+                    ProposedResolution NVARCHAR(1000) NULL,
+                    ReviewedByEmail NVARCHAR(255) NULL,
+                    ReviewedByUserId NVARCHAR(255) NULL;
+            END;
         `);
         schemaInitialized = true;
     } catch (err) {
@@ -132,7 +162,7 @@ async function ensureDatabaseSchema(p) {
 }
 
 async function getPool() {
-    if (pool && pool.connected) {
+    if (pool && (pool.connected || pool.isMock)) {
         return pool;
     }
 
@@ -157,6 +187,16 @@ async function getPool() {
     pool = await sql.connect(config);
     await ensureDatabaseSchema(pool);
     return pool;
+}
+
+function setPool(customPool) {
+    pool = customPool;
+    schemaInitialized = true;
+}
+
+function resetPool() {
+    pool = null;
+    schemaInitialized = false;
 }
 
 async function ensureDefaultAuthorityRank(rank = 4, sourceType = 'ManualUpload', description = 'Manual document upload') {
@@ -227,7 +267,13 @@ async function updateIngestionRunProgress(runId, isSuccess = true, errorSummary 
         `);
 }
 
-async function createDocument(fileName, sourceType = 'ManualUpload', authorityRank = 4, allowedUserGroups = null) {
+async function createDocument(
+    fileName,
+    sourceType = 'ManualUpload',
+    authorityRank = 4,
+    allowedUserGroups = null,
+    uploaderInfo = {}
+) {
     await ensureDefaultAuthorityRank(authorityRank, sourceType);
     const p = await getPool();
     const result = await p.request()
@@ -235,12 +281,22 @@ async function createDocument(fileName, sourceType = 'ManualUpload', authorityRa
         .input('SourceType', sql.NVarChar(50), sourceType)
         .input('AuthorityRank', sql.Int, authorityRank)
         .input('AllowedUserGroups', sql.NVarChar(1000), allowedUserGroups)
+        .input('ModifiedByEmail', sql.NVarChar(255), uploaderInfo.modifiedByEmail || null)
+        .input('ModifiedByName', sql.NVarChar(150), uploaderInfo.modifiedByName || null)
+        .input('ModifiedByUserId', sql.NVarChar(255), uploaderInfo.modifiedByUserId || null)
+        .input('CreatedByEmail', sql.NVarChar(255), uploaderInfo.createdByEmail || uploaderInfo.modifiedByEmail || null)
+        .input('CreatedByName', sql.NVarChar(150), uploaderInfo.createdByName || uploaderInfo.modifiedByName || null)
+        .input('CreatedByDepartment', sql.NVarChar(100), uploaderInfo.department || null)
         .query(`
             INSERT INTO dbo.Documents 
-                (FileName, SourceType, AuthorityRank, AllowedUserGroups, IngestionStatus, CreatedAt)
+                (FileName, SourceType, AuthorityRank, AllowedUserGroups, IngestionStatus,
+                 ModifiedByEmail, ModifiedByName, ModifiedByUserId,
+                 CreatedByEmail, CreatedByName, CreatedByDepartment, CreatedAt)
             OUTPUT INSERTED.DocumentId
             VALUES 
-                (@FileName, @SourceType, @AuthorityRank, @AllowedUserGroups, 'Processing', SYSUTCDATETIME())
+                (@FileName, @SourceType, @AuthorityRank, @AllowedUserGroups, 'Processing',
+                 @ModifiedByEmail, @ModifiedByName, @ModifiedByUserId,
+                 @CreatedByEmail, @CreatedByName, @CreatedByDepartment, SYSUTCDATETIME())
         `);
     return result.recordset[0].DocumentId;
 }
@@ -373,8 +429,189 @@ async function deleteDocumentFacts(documentId) {
         `);
 }
 
+/**
+ * Inserts a record into dbo.AuditLogs.
+ */
+async function insertAuditLog({
+    eventType,
+    documentId = null,
+    conflictId = null,
+    actionBy = 'SYSTEM',
+    actionRole = 'System',
+    previousStatus = null,
+    newStatus = null,
+    details = null,
+    correlationId = null
+}) {
+    try {
+        const p = await getPool();
+        const detailsString = details && typeof details === 'object' ? JSON.stringify(details) : (details || null);
+
+        await p.request()
+            .input('EventType', sql.NVarChar(50), String(eventType))
+            .input('DocumentId', sql.BigInt, documentId ? Number(documentId) : null)
+            .input('ConflictId', sql.BigInt, conflictId ? Number(conflictId) : null)
+            .input('ActionBy', sql.NVarChar(255), actionBy ? String(actionBy).slice(0, 255) : 'SYSTEM')
+            .input('ActionRole', sql.NVarChar(50), actionRole ? String(actionRole).slice(0, 50) : 'System')
+            .input('PreviousStatus', sql.NVarChar(50), previousStatus ? String(previousStatus).slice(0, 50) : null)
+            .input('NewStatus', sql.NVarChar(50), newStatus ? String(newStatus).slice(0, 50) : null)
+            .input('Details', sql.NVarChar(sql.MAX), detailsString)
+            .input('CorrelationId', sql.NVarChar(100), correlationId ? String(correlationId).slice(0, 100) : null)
+            .query(`
+                INSERT INTO dbo.AuditLogs 
+                    (EventType, DocumentId, ConflictId, ActionBy, ActionRole,
+                     PreviousStatus, NewStatus, Details, CorrelationId, Timestamp)
+                VALUES 
+                    (@EventType, @DocumentId, @ConflictId, @ActionBy, @ActionRole,
+                     @PreviousStatus, @NewStatus, @Details, @CorrelationId, SYSUTCDATETIME());
+            `);
+        return true;
+    } catch (err) {
+        console.warn('Notice: Failed to insert audit log entry:', err.message);
+        return false;
+    }
+}
+
+/**
+ * Retrieves audit log records for a document.
+ */
+async function getAuditLogsForDocument(documentId) {
+    if (!documentId) return [];
+    const p = await getPool();
+    const result = await p.request()
+        .input('DocumentId', sql.BigInt, Number(documentId))
+        .query(`
+            SELECT AuditId, EventType, DocumentId, ConflictId, ActionBy, ActionRole,
+                   PreviousStatus, NewStatus, Details, CorrelationId, Timestamp
+            FROM dbo.AuditLogs
+            WHERE DocumentId = @DocumentId
+            ORDER BY AuditId DESC
+        `);
+    return result.recordset;
+}
+
+/**
+ * Resolves a financial document conflict in Azure SQL.
+ */
+async function resolveDocumentConflict({
+    documentId,
+    conflictId = null,
+    action = 'ACCEPT_NEW',
+    reviewerEmail = 'SYSTEM',
+    notes = ''
+}) {
+    const docId = Number(documentId);
+    if (!docId) throw new Error('A valid documentId is required to resolve conflict.');
+
+    const p = await getPool();
+    const resolvedStatus = action === 'ACCEPT_NEW' 
+        ? 'Resolved (Accepted New)' 
+        : action === 'KEEP_EXISTING'
+            ? 'Resolved (Kept Existing)'
+            : 'Rejected';
+
+    const resolutionNotes = notes || (
+        action === 'ACCEPT_NEW'
+            ? `Accepted new figures from Document ID ${docId} as authoritative.`
+            : action === 'KEEP_EXISTING'
+                ? `Retained existing figures; new figures in Document ID ${docId} marked rejected.`
+                : `Document ID ${docId} rejected.`
+    );
+
+    // 1. Update FactConflicts
+    let conflictQuery = `
+        UPDATE dbo.FactConflicts
+        SET ResolutionStatus = @ResolutionStatus,
+            ReviewedAt = SYSUTCDATETIME(),
+            ReviewedByEmail = @ReviewerEmail,
+            ResolutionNotes = @ResolutionNotes
+        WHERE (FactId1 IN (SELECT FactId FROM dbo.FinancialFacts WHERE DocumentId = @DocId)
+           OR FactId2 IN (SELECT FactId FROM dbo.FinancialFacts WHERE DocumentId = @DocId))
+    `;
+    if (conflictId) {
+        conflictQuery += ' AND ConflictId = @ConflictId';
+    }
+
+    const cReq = p.request()
+        .input('DocId', sql.BigInt, docId)
+        .input('ResolutionStatus', sql.NVarChar(50), resolvedStatus)
+        .input('ReviewerEmail', sql.NVarChar(255), reviewerEmail)
+        .input('ResolutionNotes', sql.NVarChar(2000), resolutionNotes);
+    if (conflictId) {
+        cReq.input('ConflictId', sql.BigInt, Number(conflictId));
+    }
+    await cReq.query(conflictQuery);
+
+    // 2. Update FinancialFacts validation status based on action
+    if (action === 'ACCEPT_NEW') {
+        await p.request()
+            .input('DocId', sql.BigInt, docId)
+            .query(`
+                UPDATE dbo.FinancialFacts
+                SET ValidationStatus = 'Validated'
+                WHERE DocumentId = @DocId;
+
+                UPDATE dbo.FinancialFacts
+                SET ValidationStatus = 'Superseded'
+                WHERE FactId IN (
+                    SELECT CASE WHEN c.FactId1 IN (SELECT FactId FROM dbo.FinancialFacts WHERE DocumentId = @DocId) THEN c.FactId2 ELSE c.FactId1 END
+                    FROM dbo.FactConflicts c
+                    WHERE (c.FactId1 IN (SELECT FactId FROM dbo.FinancialFacts WHERE DocumentId = @DocId)
+                       OR c.FactId2 IN (SELECT FactId FROM dbo.FinancialFacts WHERE DocumentId = @DocId))
+                );
+
+                UPDATE dbo.Documents
+                SET IngestionStatus = 'Succeeded',
+                    LastProcessedAt = SYSUTCDATETIME()
+                WHERE DocumentId = @DocId;
+            `);
+    } else if (action === 'KEEP_EXISTING') {
+        await p.request()
+            .input('DocId', sql.BigInt, docId)
+            .query(`
+                UPDATE dbo.FinancialFacts
+                SET ValidationStatus = 'Rejected'
+                WHERE DocumentId = @DocId
+                  AND FactId IN (
+                      SELECT FactId1 FROM dbo.FactConflicts WHERE (FactId1 IN (SELECT FactId FROM dbo.FinancialFacts WHERE DocumentId = @DocId) OR FactId2 IN (SELECT FactId FROM dbo.FinancialFacts WHERE DocumentId = @DocId))
+                      UNION
+                      SELECT FactId2 FROM dbo.FactConflicts WHERE (FactId1 IN (SELECT FactId FROM dbo.FinancialFacts WHERE DocumentId = @DocId) OR FactId2 IN (SELECT FactId FROM dbo.FinancialFacts WHERE DocumentId = @DocId))
+                  );
+
+                UPDATE dbo.Documents
+                SET IngestionStatus = 'Succeeded',
+                    LastProcessedAt = SYSUTCDATETIME()
+                WHERE DocumentId = @DocId;
+            `);
+    } else if (action === 'REJECT') {
+        await p.request()
+            .input('DocId', sql.BigInt, docId)
+            .query(`
+                UPDATE dbo.FinancialFacts
+                SET ValidationStatus = 'Rejected'
+                WHERE DocumentId = @DocId;
+
+                UPDATE dbo.Documents
+                SET IngestionStatus = 'Rejected',
+                    LastProcessedAt = SYSUTCDATETIME()
+                WHERE DocumentId = @DocId;
+            `);
+    }
+
+    return {
+        documentId: docId,
+        conflictId,
+        action,
+        status: action === 'REJECT' ? 'Rejected' : 'Succeeded',
+        reviewerEmail,
+        notes: resolutionNotes
+    };
+}
+
 module.exports = {
     getPool,
+    setPool,
+    resetPool,
     startIngestionRun,
     completeIngestionRun,
     updateIngestionRunProgress,
@@ -383,6 +620,9 @@ module.exports = {
     insertFinancialFacts,
     getDocumentById,
     getFinancialFacts,
-    deleteDocumentFacts
+    deleteDocumentFacts,
+    insertAuditLog,
+    getAuditLogsForDocument,
+    resolveDocumentConflict
 };
 

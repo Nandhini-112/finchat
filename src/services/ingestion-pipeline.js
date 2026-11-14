@@ -17,6 +17,8 @@ const {
     deleteDocumentFacts
 } = require('./sql');
 const { detectAndResolveConflicts } = require('./conflict-resolver');
+const { logConflictDetected } = require('./audit-log');
+const { sendConflictNotificationEmail } = require('./notification');
 
 /**
  * Orchestrates the full 10-step enterprise ingestion pipeline.
@@ -49,7 +51,11 @@ async function processDocumentIngestion({
     authoritySource = null,
     existingRunId = null,
     manageRun = null,
-    existingDocumentId = null
+    existingDocumentId = null,
+    modifiedByEmail = null,
+    modifiedByName = null,
+    modifiedByUserId = null,
+    baseUrl = null
 }) {
     const corrId = correlationId || `ingest-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
     const log = (msg) => (context.log ? context.log(`[${corrId}] ${msg}`) : console.log(`[${corrId}] ${msg}`));
@@ -79,7 +85,13 @@ async function processDocumentIngestion({
         if (existingDocumentId) {
             documentId = existingDocumentId;
         } else {
-            documentId = await createDocument(fileName, sourceType, authorityRank, allowedUserGroups);
+            documentId = await createDocument(fileName, sourceType, authorityRank, allowedUserGroups, {
+                modifiedByEmail,
+                modifiedByName,
+                modifiedByUserId,
+                modifiedDate,
+                department
+            });
         }
 
         log(`Step 2 Output: dbo.IngestionRuns ID=${runId || 'N/A'}, dbo.Documents ID=${documentId} (Status: Processing).`);
@@ -134,12 +146,29 @@ async function processDocumentIngestion({
             log(`Step 6 Output (dbo.FactConflicts): Discovered & registered ${conflicts.length} conflict(s).`);
             if (conflicts.length > 0) {
                 for (const c of conflicts) {
-                    log(`  - Discrepancy on "${c.fact1?.Metric}": ${c.status} (${c.fact1?.SourceFileName}: ${c.fact1?.NumericValue} vs ${c.fact2?.SourceFileName}: ${c.fact2?.NumericValue})`);
+                    log(`  - Discrepancy on "${c.metric || c.fact1?.Metric}": ${c.notes}`);
                 }
+
+                // Log audit trail
+                await logConflictDetected({ documentId, conflicts, correlationId: corrId });
+
+                // Dispatch conflict notification email with resolution links
+                await sendConflictNotificationEmail({
+                    documentId,
+                    fileName,
+                    modifiedByEmail,
+                    modifiedByName,
+                    conflicts,
+                    baseUrl,
+                    correlationId: corrId,
+                    context
+                });
             }
         } else {
             log('Step 6 Output: Skipped SQL fact insertion (0 facts extracted).');
         }
+
+        const hasConflicts = conflicts.length > 0;
 
         /// STEP 7: RETRIEVAL CHUNKING
         currentStep = 'STEP 7: RETRIEVAL CHUNKING';
@@ -159,7 +188,9 @@ async function processDocumentIngestion({
         currentStep = 'STEP 8 & 9: MULTILINGUAL EMBEDDINGS & AZURE AI SEARCH';
         log(`=== ${currentStep} ===`);
 
-        if (chunks.length > 0) {
+        if (hasConflicts) {
+            log('Step 8 & 9 Notice: Azure AI Search indexing held in pending state until conflict is confirmed/resolved.');
+        } else if (chunks.length > 0) {
             const chunkTexts = chunks.map(c => `${c.title}\n${c.content}`);
             const embeddings = await generateBatchEmbeddings(chunkTexts);
             const vectorDimensions = embeddings[0] ? embeddings[0].length : 0;
@@ -200,6 +231,30 @@ async function processDocumentIngestion({
         currentStep = 'STEP 10: INGESTION COMPLETION';
         log(`=== ${currentStep} ===`);
 
+        if (hasConflicts) {
+            await updateDocumentStatus(documentId, 'Pending Review');
+            if (shouldManageRun && runId) {
+                await completeIngestionRun(runId, 0, 0, 'Pending Review', 'Document moved to Pending Review due to financial discrepancies requiring human confirmation.');
+            }
+            const conflictSummary = conflicts.map(c => c.notes).join(' | ');
+            log(`Step 10 Output: DocumentId=${documentId} moved to "Pending Review" (${conflicts.length} conflict(s) pending user confirmation).`);
+
+            return {
+                status: 'pending',
+                documentStatus: 'Pending Review',
+                documentId,
+                runId,
+                fileName,
+                authorityRank,
+                factsExtracted: extractedFacts.length,
+                chunksIndexed: 0,
+                conflictsProcessed: conflicts.length,
+                conflicts,
+                conflictSummary,
+                correlationId: corrId
+            };
+        }
+
         await updateDocumentStatus(documentId, 'Succeeded');
         if (shouldManageRun && runId) {
             await completeIngestionRun(runId, 1, 0, 'Succeeded');
@@ -211,13 +266,14 @@ async function processDocumentIngestion({
 
         return {
             status: 'success',
+            documentStatus: 'Succeeded',
             documentId,
             runId,
             fileName,
             authorityRank,
             factsExtracted: extractedFacts.length,
             chunksIndexed: chunks.length,
-            conflictsProcessed: conflicts.length,
+            conflictsProcessed: 0,
             correlationId: corrId
         };
 

@@ -1,31 +1,47 @@
 require('../utils/config');
 const { areValuesEqual } = require('./unit-normalizer');
 const { getPool } = require('./sql');
+const sql = require('mssql');
 
 /**
- * Detect and resolve conflicts across documents for the same metric, entity, and period.
+ * Detect conflicts across documents for the same metric, entity, and period.
+ * 
  * Rules:
- * 1. Authority rank priority: Audited Financials (Rank 1) > Board Packs / Final (Rank 2) > Drafts (Rank 3) > Sample/Test (Rank 4).
- * 2. If ranks differ: Higher authority is adopted as authoritative; status = 'Resolved (Higher Authority Adopted)'.
- * 3. If ranks are EQUAL: Flags as 'Unresolved - Review Required' rather than arbitrarily picking one.
+ * 1. Exact equality filtering: If values are equal (areValuesEqual), ignore (no conflict).
+ * 2. Zero Auto-Resolution: When values differ, always flag conflict with status 'Pending Review'.
+ * 3. Enriched Provenance: Extracts existing document's uploader and authority to formulate clear notifications.
+ *
+ * @param {number|string} [targetDocId=null] - Optional DocumentId of newly ingested document
+ * @returns {Promise<Array<Object>>} List of detected conflicts with full provenance
  */
-async function detectAndResolveConflicts(documentId = null) {
+async function detectAndResolveConflicts(targetDocId = null) {
     const pool = await getPool();
+    const docIdNum = targetDocId ? Number(targetDocId) : null;
 
     let query = `
         SELECT f.FactId, f.DocumentId, f.Metric, f.Entity, f.PeriodLabel,
                f.NumericValue, f.TextValue, f.Unit, f.Currency, f.SourceLocation,
                ISNULL(f.AuthorityRank, d.AuthorityRank) AS AuthorityRank,
                d.FileName AS SourceFileName,
+               d.CreatedByName, d.CreatedByEmail,
+               d.ModifiedByName, d.ModifiedByEmail,
+               d.IngestionStatus,
+               f.CreatedAt AS FactCreatedAt,
                r.SourceType AS AuthorityType
         FROM dbo.FinancialFacts f
         JOIN dbo.Documents d ON f.DocumentId = d.DocumentId
         LEFT JOIN dbo.SourceAuthorityRanks r ON ISNULL(f.AuthorityRank, d.AuthorityRank) = r.AuthorityRank
         WHERE f.NumericValue IS NOT NULL
-          AND (d.IngestionStatus = 'Succeeded' OR d.IngestionStatus IS NULL)
+          AND (d.IngestionStatus = 'Succeeded' 
+               OR d.IngestionStatus = 'Processing' 
+               OR d.IngestionStatus = 'Pending Review' 
+               OR @DocId IS NOT NULL AND d.DocumentId = @DocId 
+               OR d.IngestionStatus IS NULL)
     `;
 
-    const result = await pool.request().query(query);
+    const req = pool.request();
+    req.input('DocId', sql.BigInt, docIdNum);
+    const result = await req.query(query);
     const allFacts = result.recordset;
 
     // Group facts by metric + entity + period
@@ -41,69 +57,101 @@ async function detectAndResolveConflicts(documentId = null) {
     for (const [, factsInGroup] of grouped.entries()) {
         if (factsInGroup.length < 2) continue;
 
-        // Sort ascending by authority rank (Rank 1 is highest authority)
-        factsInGroup.sort((a, b) => (a.AuthorityRank || 4) - (b.AuthorityRank || 4));
-        const highestAuthFact = factsInGroup[0];
+        // If targetDocId is provided, only inspect groups that contain facts from targetDocId
+        if (docIdNum && !factsInGroup.some(f => f.DocumentId === docIdNum)) {
+            continue;
+        }
 
-        for (let i = 1; i < factsInGroup.length; i++) {
-            const comparisonFact = factsInGroup[i];
-            if (highestAuthFact.DocumentId === comparisonFact.DocumentId) continue;
+        // Compare each pair in the group
+        for (let i = 0; i < factsInGroup.length; i++) {
+            for (let j = i + 1; j < factsInGroup.length; j++) {
+                let f1 = factsInGroup[i];
+                let f2 = factsInGroup[j];
 
-            // Do not flag a conflict between two records from the same file (e.g. re-ingested copies or multi-page entries)
-            if (highestAuthFact.SourceFileName && comparisonFact.SourceFileName &&
-                highestAuthFact.SourceFileName.toLowerCase() === comparisonFact.SourceFileName.toLowerCase()) {
-                continue;
-            }
-
-            const isIdentical = areValuesEqual(highestAuthFact.NumericValue, comparisonFact.NumericValue);
-
-            if (!isIdentical) {
-                const diff = Number((comparisonFact.NumericValue - highestAuthFact.NumericValue).toFixed(4));
-                const rank1 = highestAuthFact.AuthorityRank || 4;
-                const rank2 = comparisonFact.AuthorityRank || 4;
-
-                let resolutionStatus = 'Resolved';
-                let resolutionNotes = '';
-
-                if (rank1 < rank2) {
-                    // Different ranks: Highest authority wins
-                    resolutionStatus = 'Resolved (Higher Authority Adopted)';
-                    resolutionNotes = `Discrepancy for ${highestAuthFact.Metric}: Adopted ${highestAuthFact.AuthorityType || 'Rank ' + rank1} from "${highestAuthFact.SourceFileName}" (${highestAuthFact.NumericValue} ${highestAuthFact.Currency}) over lower-authority ${comparisonFact.AuthorityType || 'Rank ' + rank2} from "${comparisonFact.SourceFileName}" (${comparisonFact.NumericValue} ${comparisonFact.Currency}). Difference: ${diff}.`;
-                } else {
-                    // Equal ranks: DO NOT pick one; flag for review
-                    resolutionStatus = 'Unresolved - Review Required';
-                    resolutionNotes = `Equal-rank disagreement for ${highestAuthFact.Metric}: "${highestAuthFact.SourceFileName}" reports ${highestAuthFact.NumericValue} ${highestAuthFact.Currency} while "${comparisonFact.SourceFileName}" reports ${comparisonFact.NumericValue} ${comparisonFact.Currency} (both hold ${highestAuthFact.AuthorityType || 'Rank ' + rank1}). Flagged for human review. Difference: ${diff}.`;
+                // Skip facts from the same document or same file name
+                if (f1.DocumentId === f2.DocumentId) continue;
+                if (f1.SourceFileName && f2.SourceFileName &&
+                    f1.SourceFileName.toLowerCase() === f2.SourceFileName.toLowerCase()) {
+                    continue;
                 }
 
+                // If targetDocId is given, ensure f2 is the newly uploaded document fact
+                if (docIdNum) {
+                    if (f1.DocumentId === docIdNum && f2.DocumentId !== docIdNum) {
+                        const temp = f1;
+                        f1 = f2;
+                        f2 = temp;
+                    } else if (f2.DocumentId !== docIdNum) {
+                        continue;
+                    }
+                }
+
+                const existingFact = f1;
+                const uploadedFact = f2;
+
+                // Rule 1: Exact equality -> ignore
+                const isIdentical = areValuesEqual(existingFact.NumericValue, uploadedFact.NumericValue);
+                if (isIdentical) {
+                    continue;
+                }
+
+                // Rule 2: Values differ -> Conflict Detected (Never auto-resolve based on rank)
+                const diff = Number((uploadedFact.NumericValue - existingFact.NumericValue).toFixed(4));
+                const resolutionStatus = 'Pending Review';
+
+                const existingUploader = existingFact.ModifiedByName || 
+                                         existingFact.CreatedByName || 
+                                         existingFact.ModifiedByEmail || 
+                                         existingFact.CreatedByEmail || 
+                                         existingFact.AuthorityType || 
+                                         'Authority Source';
+
+                const existingDocName = existingFact.SourceFileName || 'existing document';
+                const uploadedDocName = uploadedFact.SourceFileName || 'uploaded document';
+
+                const conflictNarrative = `FinChat already has a document uploaded by ${existingUploader} with document name "${existingDocName}" which has conflicts with your uploaded document "${uploadedDocName}" on metric "${uploadedFact.Metric}": ${existingFact.NumericValue} ${existingFact.Currency || ''} vs ${uploadedFact.NumericValue} ${uploadedFact.Currency || ''} (Difference: ${diff > 0 ? '+' + diff : diff}).`;
+                const proposedResolution = `Confirmation required: Verify whether new figure (${uploadedFact.NumericValue}) from "${uploadedDocName}" supersedes existing figure (${existingFact.NumericValue}) from "${existingDocName}".`;
+
                 await pool.request()
-                    .input('F1', highestAuthFact.FactId)
-                    .input('F2', comparisonFact.FactId)
-                    .input('Reason', `Value mismatch: ${highestAuthFact.NumericValue} vs ${comparisonFact.NumericValue}`)
+                    .input('F1', existingFact.FactId)
+                    .input('F2', uploadedFact.FactId)
+                    .input('Reason', `Value mismatch: ${existingFact.NumericValue} vs ${uploadedFact.NumericValue}`)
                     .input('Status', resolutionStatus)
-                    .input('Notes', resolutionNotes)
+                    .input('Notes', conflictNarrative)
+                    .input('Proposed', proposedResolution)
                     .query(`
                         IF NOT EXISTS (
                             SELECT 1 FROM dbo.FactConflicts 
                             WHERE (FactId1 = @F1 AND FactId2 = @F2) OR (FactId1 = @F2 AND FactId2 = @F1)
                         )
                         BEGIN
-                            INSERT INTO dbo.FactConflicts (FactId1, FactId2, ConflictReason, ResolutionStatus, ResolutionNotes, CreatedAt)
-                            VALUES (@F1, @F2, @Reason, @Status, @Notes, SYSUTCDATETIME());
+                            INSERT INTO dbo.FactConflicts (FactId1, FactId2, ConflictReason, ResolutionStatus, ResolutionNotes, ProposedResolution, CreatedAt)
+                            VALUES (@F1, @F2, @Reason, @Status, @Notes, @Proposed, SYSUTCDATETIME());
                         END
                         ELSE
                         BEGIN
                             UPDATE dbo.FactConflicts 
-                            SET ResolutionStatus = @Status, ResolutionNotes = @Notes
+                            SET ResolutionStatus = @Status, ResolutionNotes = @Notes, ProposedResolution = @Proposed
                             WHERE (FactId1 = @F1 AND FactId2 = @F2) OR (FactId1 = @F2 AND FactId2 = @F1);
                         END
                     `);
 
                 detectedConflicts.push({
-                    fact1: highestAuthFact,
-                    fact2: comparisonFact,
+                    fact1: existingFact,
+                    fact2: uploadedFact,
+                    existingFileName: existingDocName,
+                    uploadedFileName: uploadedDocName,
+                    existingUploader,
+                    existingValue: existingFact.NumericValue,
+                    uploadedValue: uploadedFact.NumericValue,
+                    metric: uploadedFact.Metric,
+                    period: uploadedFact.PeriodLabel,
+                    entity: uploadedFact.Entity,
+                    currency: uploadedFact.Currency,
                     difference: diff,
                     status: resolutionStatus,
-                    notes: resolutionNotes
+                    notes: conflictNarrative,
+                    proposedResolution
                 });
             }
         }
@@ -112,6 +160,9 @@ async function detectAndResolveConflicts(documentId = null) {
     return detectedConflicts;
 }
 
+/**
+ * Returns facts for a document annotated with active conflict governance information.
+ */
 async function getFactsWithConflictContext(documentId = null) {
     const pool = await getPool();
 
@@ -125,7 +176,7 @@ async function getFactsWithConflictContext(documentId = null) {
         FROM dbo.FinancialFacts f
         JOIN dbo.Documents d ON f.DocumentId = d.DocumentId
         LEFT JOIN dbo.SourceAuthorityRanks r ON ISNULL(f.AuthorityRank, d.AuthorityRank) = r.AuthorityRank
-        WHERE (d.IngestionStatus = 'Succeeded' OR d.IngestionStatus IS NULL)
+        WHERE (d.IngestionStatus = 'Succeeded' OR d.IngestionStatus = 'Pending Review' OR d.IngestionStatus IS NULL)
     `;
 
     if (documentId) {
@@ -140,7 +191,7 @@ async function getFactsWithConflictContext(documentId = null) {
     const facts = factsResult.recordset;
 
     const conflictsResult = await pool.request().query(`
-        SELECT ConflictId, FactId1, FactId2, ConflictReason, ResolutionStatus, ResolutionNotes
+        SELECT ConflictId, FactId1, FactId2, ConflictReason, ResolutionStatus, ResolutionNotes, ProposedResolution
         FROM dbo.FactConflicts
     `);
     const conflicts = conflictsResult.recordset;
@@ -153,14 +204,16 @@ async function getFactsWithConflictContext(documentId = null) {
                 hasConflict: true,
                 conflictId: activeConflict.ConflictId,
                 conflictStatus: activeConflict.ResolutionStatus,
-                conflictExplanation: activeConflict.ResolutionNotes
+                conflictExplanation: activeConflict.ResolutionNotes,
+                proposedResolution: activeConflict.ProposedResolution
             };
         }
         return {
             ...fact,
             hasConflict: false,
             conflictStatus: null,
-            conflictExplanation: null
+            conflictExplanation: null,
+            proposedResolution: null
         };
     });
 }

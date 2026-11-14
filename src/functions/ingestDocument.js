@@ -79,6 +79,17 @@ app.http('ingestDocument', {
             let department = firstText(request.query.get('department'), request.headers.get('x-department'));
             let jobTitle = firstText(request.query.get('jobTitle'), request.headers.get('x-job-title'));
             let modifiedDate = firstText(request.query.get('modifiedDate'), request.headers.get('x-modified-date'));
+            let modifiedByEmail = firstText(
+                request.query.get('modifiedByEmail'),
+                request.headers.get('x-modified-by-email'),
+                request.headers.get('x-user-email'),
+                request.headers.get('x-modified-user')
+            );
+            let modifiedByName = firstText(
+                request.query.get('modifiedByName'),
+                request.headers.get('x-modified-by-name'),
+                request.headers.get('x-user-name')
+            );
 
             // Check async parameter (?async=false allows synchronous mode if explicitly requested)
             const isAsync = request.query.get('async') !== 'false' && request.headers.get('x-async') !== 'false';
@@ -108,6 +119,8 @@ app.http('ingestDocument', {
                 department = firstText(formData.get('department'), department);
                 jobTitle = firstText(formData.get('jobTitle'), jobTitle);
                 modifiedDate = firstText(formData.get('modifiedDate'), modifiedDate);
+                modifiedByEmail = firstText(formData.get('modifiedByEmail'), formData.get('userEmail'), modifiedByEmail);
+                modifiedByName = firstText(formData.get('modifiedByName'), formData.get('userName'), modifiedByName);
 
                 // Collect all files uploaded in formData (supports single and multiple files)
                 for (const [key, val] of formData.entries()) {
@@ -140,6 +153,8 @@ app.http('ingestDocument', {
                 department = firstText(jsonBody.department, department);
                 jobTitle = firstText(jsonBody.jobTitle, jobTitle);
                 modifiedDate = firstText(jsonBody.modifiedDate, modifiedDate);
+                modifiedByEmail = firstText(jsonBody.modifiedByEmail, jsonBody.userEmail, modifiedByEmail);
+                modifiedByName = firstText(jsonBody.modifiedByName, jsonBody.userName, modifiedByName);
 
                 let fileBuffer;
                 if (jsonBody.text || jsonBody.content) {
@@ -187,7 +202,12 @@ app.http('ingestDocument', {
                 // Pre-register all documents in Azure SQL immediately (Status: Processing)
                 const registeredDocs = [];
                 for (const item of filesToProcess) {
-                    const docId = await createDocument(item.fileName, sourceType, authorityRank, allowedUserGroups);
+                    const docId = await createDocument(item.fileName, sourceType, authorityRank, allowedUserGroups, {
+                        modifiedByEmail,
+                        modifiedByName,
+                        modifiedDate,
+                        department
+                    });
                     registeredDocs.push({
                         documentId: docId,
                         fileName: item.fileName,
@@ -235,6 +255,8 @@ app.http('ingestDocument', {
                                     department,
                                     jobTitle,
                                     modifiedDate,
+                                    modifiedByEmail,
+                                    modifiedByName,
                                     existingRunId: batchRunId,
                                     manageRun: false,
                                     existingDocumentId: doc.documentId
@@ -317,7 +339,9 @@ app.http('ingestDocument', {
                     fileLink,
                     department,
                     jobTitle,
-                    modifiedDate
+                    modifiedDate,
+                    modifiedByEmail,
+                    modifiedByName
                 });
                 syncResults.push(res);
             }

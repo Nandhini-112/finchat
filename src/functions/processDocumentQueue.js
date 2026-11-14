@@ -56,13 +56,25 @@ app.timer('processDocumentQueue', {
             // 3. Worker task for individual document processing
             async function processRecord(record, index) {
                 const itemCorrelationId = `sp-ingest-${Date.now()}-${record.id}`;
-                context.log(
-                    `[QueueProcessor] [Item ${index + 1}/${pendingItems.length}] ` +
-                    `FileName: "${record.FileName}", ` +
-                    `DriveId: "${record.DriveId}", ` +
-                    `ItemId: "${record.DriveItemId}", ` +
-                    `Rank: ${record.AuthorityRank || 4}`
-                );
+                context.log(`[QueueProcessor] ========================================================`);
+                context.log(`[QueueProcessor] === RETRIEVED SHAREPOINT RECORD [${index + 1}/${pendingItems.length}] ===`);
+                context.log(`[QueueProcessor]   - SharePoint Item ID : ${record.id}`);
+                context.log(`[QueueProcessor]   - File Name          : "${record.FileName}"`);
+                context.log(`[QueueProcessor]   - Title              : "${record.Title || 'N/A'}"`);
+                context.log(`[QueueProcessor]   - Processing Status  : "${record.ProcessingStatus}"`);
+                context.log(`[QueueProcessor]   - Authority Rank     : ${record.AuthorityRank || 4}`);
+                context.log(`[QueueProcessor]   - Modified Date      : ${record.ModifiedDate || 'N/A'}`);
+                context.log(`[QueueProcessor]   - Modified By Email  : ${record.ModifiedByEmail || 'N/A'}`);
+                context.log(`[QueueProcessor]   - Modified By Name   : ${record.ModifiedByName || 'N/A'}`);
+                context.log(`[QueueProcessor]   - Department         : ${record.CreatedByDepartment || 'N/A'}`);
+                context.log(`[QueueProcessor]   - Job Title          : ${record.CreatedByJobTitle || 'N/A'}`);
+                context.log(`[QueueProcessor]   - Allowed User Groups: ${record.AllowedUserGroups || 'N/A'}`);
+                context.log(`[QueueProcessor]   - Drive ID           : "${record.DriveId || 'N/A'}"`);
+                context.log(`[QueueProcessor]   - Drive Item ID      : "${record.DriveItemId || 'N/A'}"`);
+                context.log(`[QueueProcessor]   - File Link          : ${record.FileLink || 'N/A'}`);
+                context.log(`[QueueProcessor]   - Document Key       : ${record.DocumentKey || 'N/A'}`);
+                context.log(`[QueueProcessor]   - Queue Key          : ${record.QueueKey || 'N/A'}`);
+                context.log(`[QueueProcessor] ========================================================`);
 
                 try {
                     // Step 0: Immediate Concurrency Lock -> 'Processing'
@@ -104,13 +116,21 @@ app.timer('processDocumentQueue', {
                         fileLink: blankToNull(record.FileLink),
                         department: blankToNull(record.CreatedByDepartment),
                         jobTitle: blankToNull(record.CreatedByJobTitle),
-                        modifiedDate: blankToNull(record.ModifiedDate)
+                        modifiedDate: blankToNull(record.ModifiedDate),
+                        modifiedByEmail: blankToNull(record.ModifiedByEmail),
+                        modifiedByName: blankToNull(record.ModifiedByName)
                     });
 
-                    // Step C: Update SharePoint Queue List Item status to 'Processed'
-                    await updateQueueItemStatus(graphClient, siteId, listId, record.id, 'Processed', '');
-                    context.log(`[QueueProcessor] SharePoint List Item ${record.id} marked as "Processed" (DocumentId=${ingestionResult.documentId}).`);
-                    processedCount++;
+                    // Step C: Update SharePoint Queue List Item status
+                    if (ingestionResult.status === 'pending') {
+                        const conflictMsg = ingestionResult.conflictSummary || 'Financial discrepancies detected requiring review.';
+                        await updateQueueItemStatus(graphClient, siteId, listId, record.id, 'Pending Review', conflictMsg, true);
+                        context.log(`[QueueProcessor] SharePoint List Item ${record.id} marked as "Pending Review" (ConflictDetected=Yes, DocumentId=${ingestionResult.documentId}).`);
+                    } else {
+                        await updateQueueItemStatus(graphClient, siteId, listId, record.id, 'Processed', '', false);
+                        context.log(`[QueueProcessor] SharePoint List Item ${record.id} marked as "Processed" (ConflictDetected=No, DocumentId=${ingestionResult.documentId}).`);
+                        processedCount++;
+                    }
 
                     // Step D: Dynamically update IngestionRun progress in Azure SQL
                     if (batchRunId) {

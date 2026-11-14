@@ -11,13 +11,10 @@ const { findRelevantStructuredFacts, formatSourceReferences } = require('../serv
 const { generateAnswer } = require('../services/answer-generation');
 const { getActiveModelInfo } = require('../services/model-client');
 
-app.http('chat', {
-    methods: ['POST'],
-    authLevel: 'anonymous',
-    handler: async (request, context) => {
-        const generatedCorrelationId = `chat-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-        let correlationId = generatedCorrelationId;
-        context.log(`[${correlationId}] >>> START CHAT REQUEST <<< URL=${request.url}`);
+async function chatHandler(request, context) {
+    const generatedCorrelationId = `chat-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+    let correlationId = generatedCorrelationId;
+    context.log(`[${correlationId}] >>> START CHAT REQUEST <<< URL=${request.url}`);
 
         let currentStep = 'INITIALIZATION';
 
@@ -29,9 +26,9 @@ app.http('chat', {
             const userGroupsHeader = request.headers.get('x-user-groups') || (body && body.userGroups) || null;
 
             const jobId = (body && (body.jobId || body.job_id || body.correlationId)) ||
-                          request.headers.get('x-job-id') ||
-                          request.headers.get('x-correlation-id') ||
-                          generatedCorrelationId;
+                request.headers.get('x-job-id') ||
+                request.headers.get('x-correlation-id') ||
+                generatedCorrelationId;
             correlationId = jobId;
 
             // Log the chosen LLM for this current job ID
@@ -81,6 +78,21 @@ app.http('chat', {
                         body: JSON.stringify({
                             status: 'PROCESSING',
                             answer: `Document "${targetDoc.FileName}" is currently being processed. Please try again shortly.`,
+                            documentId: targetDoc.DocumentId,
+                            sources: [],
+                            insufficientEvidence: true,
+                            correlationId
+                        })
+                    };
+                }
+
+                if (targetDoc.IngestionStatus === 'Pending Review') {
+                    return {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            status: 'PENDING_REVIEW',
+                            answer: `Document "${targetDoc.FileName}" has detected financial discrepancies and is currently pending user review/confirmation.`,
                             documentId: targetDoc.DocumentId,
                             sources: [],
                             insufficientEvidence: true,
@@ -283,4 +295,13 @@ app.http('chat', {
             return toErrorResponse(error, correlationId);
         }
     }
+
+app.http('chat', {
+    methods: ['POST'],
+    authLevel: 'anonymous',
+    handler: chatHandler
 });
+
+module.exports = {
+    chatHandler
+};
